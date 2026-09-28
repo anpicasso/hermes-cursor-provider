@@ -15,8 +15,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       - run: pip install 'h2>=4.2,<5' 'protobuf>=6.33.5,<7' 'httpx>=0.28,<1' pytest
       - run: pytest -q
-      - run: pip install 'git+https://github.com/NousResearch/hermes-agent.git@main'
-      - run: hermes plugins validate provider --json
+      - run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+      - run: pip install -e "$RUNNER_TEMP/hermes-agent"
+      - run: PYTHONPATH="$RUNNER_TEMP/hermes-agent" python scripts/current_main_probe.py
