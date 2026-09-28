@@ -27,6 +27,13 @@ def main() -> None:
         assert profile.auth_handler is None
         assert profile.refresh_credential is None
         assert profile.env_vars == ("CURSOR_API_KEY",)
+        assert profile.build_api_kwargs_extras(
+            session_id="session-1", cache_scope_id="scope-1"
+        ) == ({}, {"_cursor_session_scope": "scope-1"})
+        assert profile.build_api_kwargs_extras(session_id="session-1") == (
+            {}, {"_cursor_session_scope": "session-1"}
+        )
+        assert profile.build_api_kwargs_extras() == ({}, {})
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -35,6 +42,25 @@ def main() -> None:
         assert runtime["api_key"] == "offline-probe-token"
         assert runtime["base_url"] == "https://api.cursor.com"
         assert runtime["api_mode"] == "chat_completions"
+
+        from run_agent import AIAgent
+        from agent.chat_completion_helpers import build_api_kwargs
+
+        agent = AIAgent(
+            api_key=runtime["api_key"],
+            base_url=runtime["base_url"],
+            provider="cursor",
+            model="auto",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        setattr(agent, "session_id", "offline-session")
+        request = build_api_kwargs(
+            agent, [{"role": "user", "content": "hello"}], []
+        )
+        assert request.get("_cursor_session_scope")
+        agent.close()
 
         client = profile.create_client(api_key=runtime["api_key"], base_url=runtime["base_url"])
         assert client is not None

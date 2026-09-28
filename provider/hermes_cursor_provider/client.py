@@ -1,15 +1,21 @@
 """OpenAI-compatible facade over Cursor's official Python SDK."""
 from __future__ import annotations
 
+import atexit
 import asyncio
 import base64
+import hashlib
 import importlib
 import json
+import os
 import re
+import shutil
 import tempfile
 import threading
 import uuid
+from collections import OrderedDict
 from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -71,6 +77,29 @@ def _content_text(content: Any) -> str:
     return str(content or "")
 
 
+def _canonical_tool_calls(calls: Any) -> list[dict[str, Any]]:
+    canonical: list[dict[str, Any]] = []
+    for raw in calls if isinstance(calls, list) else []:
+        call = _plain(raw)
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = function.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        canonical.append(
+            {
+                "id": str(call.get("id") or call.get("call_id") or ""),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+    return canonical
+
+
 def _conversation(messages: list[Any]) -> list[dict[str, Any]]:
     transcript: list[dict[str, Any]] = []
     for raw in messages:
@@ -84,8 +113,8 @@ def _conversation(messages: list[Any]) -> list[dict[str, Any]]:
         for key in ("name", "tool_call_id"):
             if message.get(key):
                 item[key] = str(message[key])
-        calls = message.get("tool_calls")
-        if isinstance(calls, list) and calls:
+        calls = _canonical_tool_calls(message.get("tool_calls"))
+        if calls:
             item["tool_calls"] = calls
         transcript.append(item)
     return transcript
@@ -332,6 +361,168 @@ def _model_id(model: str | None) -> str | None:
     return "auto" if value.lower() in {"", "auto", "default"} else value
 
 
+def _assistant_history(content: str, calls: list[Any]) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": content or ""}
+    canonical = _canonical_tool_calls(calls)
+    if canonical:
+        message["tool_calls"] = canonical
+    return message
+
+
+def _home_key() -> str:
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    except (ImportError, RuntimeError):
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return str(home.expanduser().resolve())
+
+
+def _max_sessions() -> int:
+    try:
+        value = int(os.environ.get("HERMES_CURSOR_MAX_SESSIONS", "16"))
+    except ValueError:
+        value = 16
+    return max(1, min(value, 128))
+
+
+def _load_cursor_client() -> Any:
+    try:
+        return importlib.import_module("cursor_sdk").CursorClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Cursor provider requires cursor-sdk. Reinstall the plugin so Hermes installs its dependencies."
+        ) from exc
+
+
+@dataclass
+class _Bridge:
+    home: str
+    workspace: tempfile.TemporaryDirectory[str]
+    sdk: Any = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def client(self) -> Any:
+        with self.lock:
+            if self.sdk is None:
+                self.sdk = _load_cursor_client().launch_bridge(
+                    workspace=self.workspace.name,
+                    state_root=str(Path(self.workspace.name) / "state"),
+                    local={"cwd": self.workspace.name},
+                    allow_api_key_env_fallback=False,
+                )
+            return self.sdk
+
+    def close(self) -> None:
+        with self.lock:
+            sdk, self.sdk = self.sdk, None
+        if sdk is not None:
+            with suppress(Exception):
+                sdk.close()
+        self.workspace.cleanup()
+
+
+@dataclass
+class _Session:
+    key: tuple[str, str, str, str]
+    bridge: _Bridge
+    cwd: Path
+    agent: Any = None
+    history: list[dict[str, Any]] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+_REGISTRY_LOCK = threading.RLock()
+_BRIDGES: dict[str, _Bridge] = {}
+_SESSIONS: OrderedDict[tuple[str, str, str, str], _Session] = OrderedDict()
+
+
+def _new_bridge(home: str) -> _Bridge:
+    root = Path(home) / "cache" / "cursor-sdk"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with suppress(OSError):
+        root.chmod(0o700)
+    workspace = tempfile.TemporaryDirectory(prefix="runtime-", dir=str(root))
+    with suppress(OSError):
+        Path(workspace.name).chmod(0o700)
+    return _Bridge(home=home, workspace=workspace)
+
+
+def _bridge_for(home: str) -> _Bridge:
+    with _REGISTRY_LOCK:
+        bridge = _BRIDGES.get(home)
+        if bridge is None:
+            bridge = _BRIDGES[home] = _new_bridge(home)
+        return bridge
+
+
+def _close_session(session: _Session) -> None:
+    if session.agent is not None:
+        with suppress(Exception):
+            session.agent.close()
+        session.agent = None
+    session.history.clear()
+    shutil.rmtree(session.cwd, ignore_errors=True)
+
+
+def _lease_session(key: tuple[str, str, str, str]) -> _Session | None:
+    evicted: list[_Session] = []
+    with _REGISTRY_LOCK:
+        session = _SESSIONS.get(key)
+        if session is None:
+            bridge = _bridge_for(key[0])
+            digest = hashlib.blake2b("\0".join(key).encode(), digest_size=16).hexdigest()
+            sessions_root = Path(bridge.workspace.name) / "sessions"
+            sessions_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with suppress(OSError):
+                sessions_root.chmod(0o700)
+            # ponytail: unique paths keep delayed eviction cleanup from touching a replacement.
+            cwd = Path(tempfile.mkdtemp(prefix=f"{digest[:8]}-", dir=str(sessions_root)))
+            session = _SESSIONS[key] = _Session(key=key, bridge=bridge, cwd=cwd)
+        if not session.lock.acquire(blocking=False):
+            return None
+        _SESSIONS.move_to_end(key)
+        while len(_SESSIONS) > _max_sessions():
+            victim_key = next(
+                (
+                    candidate_key
+                    for candidate_key, candidate in _SESSIONS.items()
+                    if candidate is not session and not candidate.lock.locked()
+                ),
+                None,
+            )
+            if victim_key is None:
+                break
+            evicted.append(_SESSIONS.pop(victim_key))
+    for victim in evicted:
+        _close_session(victim)
+    return session
+
+
+def _release_session(session: _Session) -> None:
+    with _REGISTRY_LOCK:
+        if _SESSIONS.get(session.key) is session:
+            _SESSIONS.move_to_end(session.key)
+        session.lock.release()
+
+
+def _reset_session_registry() -> None:
+    """Close process-owned Cursor resources. Public only for tests and atexit."""
+    with _REGISTRY_LOCK:
+        sessions = list(_SESSIONS.values())
+        bridges = list(_BRIDGES.values())
+        _SESSIONS.clear()
+        _BRIDGES.clear()
+    for session in sessions:
+        _close_session(session)
+    for bridge in bridges:
+        bridge.close()
+
+
+atexit.register(_reset_session_registry)
+
+
 class _Completions:
     def __init__(self, client: "CursorSDKClient") -> None:
         self._client = client
@@ -352,15 +543,10 @@ class CursorSDKClient:
 
     def __init__(self, *, api_key: Any = None, base_url: str | None = None, **_: Any) -> None:
         self.api_key = _secret(api_key)
-        supplied_url = str(base_url or CURSOR_API_URL).rstrip("/")
-        if supplied_url != CURSOR_API_URL:
-            raise ValueError(f"Cursor SDK provider only accepts {CURSOR_API_URL}")
+        self._supplied_url = str(base_url or CURSOR_API_URL).rstrip("/")
         self.base_url = CURSOR_API_URL
         self.chat = SimpleNamespace(completions=_Completions(self))
         self.is_closed = False
-        self._workspace = tempfile.TemporaryDirectory(prefix="hermes-cursor-sdk-")
-        self._sdk: Any = None
-        self._sdk_lock = threading.Lock()
         self._runs: set[Any] = set()
         self._runs_lock = threading.Lock()
 
@@ -370,24 +556,20 @@ class CursorSDKClient:
     def __exit__(self, *_: Any) -> None:
         self.close()
 
-    def _sdk_client(self) -> Any:
+    def _validate_request(self) -> None:
         if self.is_closed:
             raise RuntimeError("Cursor SDK client is closed")
-        with self._sdk_lock:
-            if self._sdk is None:
-                try:
-                    CursorClient = importlib.import_module("cursor_sdk").CursorClient
-                except ImportError as exc:
-                    raise RuntimeError(
-                        "The Cursor provider requires cursor-sdk. Reinstall the plugin so Hermes installs its dependencies."
-                    ) from exc
-                self._sdk = CursorClient.launch_bridge(
-                    workspace=self._workspace.name,
-                    state_root=str(Path(self._workspace.name) / "state"),
-                    local={"cwd": self._workspace.name},
-                    allow_api_key_env_fallback=False,
-                )
-            return self._sdk
+        if self._supplied_url != CURSOR_API_URL:
+            raise ValueError(f"Cursor SDK provider only accepts {CURSOR_API_URL}")
+        if not self.api_key:
+            raise RuntimeError(
+                "CURSOR_API_KEY is not configured. Create a user API key at https://cursor.com/dashboard/api, "
+                "then run `hermes auth add cursor`."
+            )
+
+    def _sdk_client(self) -> Any:
+        self._validate_request()
+        return _bridge_for(_home_key()).client()
 
     def cancel(self) -> None:
         with self._runs_lock:
@@ -401,27 +583,16 @@ class CursorSDKClient:
             return
         self.is_closed = True
         self.cancel()
-        with self._sdk_lock:
-            sdk, self._sdk = self._sdk, None
-        if sdk is not None:
-            with suppress(Exception):
-                sdk.close()
-        self._workspace.cleanup()
 
-    def _run_sdk(
+    def _create_agent(
         self,
         *,
-        prompt: str,
-        images: list[dict[str, str]],
+        bridge: _Bridge,
+        cwd: Path,
         model: str | None,
         timeout: float,
     ) -> Any:
-        if not self.api_key:
-            raise RuntimeError(
-                "CURSOR_API_KEY is not configured. Create a user API key at https://cursor.com/dashboard/api, "
-                "then run `hermes auth add cursor`."
-            )
-        client = self._sdk_client().with_options(
+        client = bridge.client().with_options(
             timeout=timeout,
             unary_timeout=min(timeout, 30.0),
             stream_timeout=timeout,
@@ -429,7 +600,7 @@ class CursorSDKClient:
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "local": {
-                "cwd": self._workspace.name,
+                "cwd": str(cwd),
                 "sandbox_options": {"enabled": True},
             },
             "mcp_servers": {},
@@ -438,19 +609,141 @@ class CursorSDKClient:
         selected_model = _model_id(model)
         if selected_model:
             options["model"] = selected_model
-        agent = client.create_agent(options)
+        return client.create_agent(options)
+
+    def _run_agent(self, agent: Any, *, prompt: str, images: list[dict[str, str]]) -> Any:
         run = None
         try:
             run = agent.send({"text": prompt, "images": images})
             with self._runs_lock:
                 self._runs.add(run)
             return run.wait()
+        except BaseException:
+            if run is not None:
+                with suppress(Exception):
+                    run.cancel()
+            raise
         finally:
             if run is not None:
                 with self._runs_lock:
                     self._runs.discard(run)
-            with suppress(Exception):
-                agent.close()
+
+    def _run_ephemeral(
+        self,
+        *,
+        bridge: _Bridge,
+        prompt: str,
+        images: list[dict[str, str]],
+        model: str | None,
+        timeout: float,
+    ) -> Any:
+        sessions_root = Path(bridge.workspace.name) / "sessions"
+        sessions_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="ephemeral-", dir=str(sessions_root)) as cwd:
+            agent = self._create_agent(
+                bridge=bridge, cwd=Path(cwd), model=model, timeout=timeout
+            )
+            try:
+                return self._run_agent(agent, prompt=prompt, images=images)
+            finally:
+                with suppress(Exception):
+                    agent.close()
+
+    def _execute(
+        self,
+        *,
+        model: str | None,
+        messages: list[Any],
+        tools: list[Any] | None,
+        tool_choice: Any,
+        timeout: float,
+        session_scope: str,
+    ) -> tuple[Any, list[Any], str]:
+        self._validate_request()
+        home = _home_key()
+        bridge = _bridge_for(home)
+        incoming = _conversation(messages)
+
+        if not session_scope:
+            prompt, allowed_names = render_prompt(
+                messages, tools=tools, tool_choice=tool_choice
+            )
+            result = self._run_ephemeral(
+                bridge=bridge,
+                prompt=prompt,
+                images=extract_images(messages),
+                model=model,
+                timeout=timeout,
+            )
+            calls, content = extract_tool_calls(
+                str(getattr(result, "result", "") or ""), allowed_names
+            )
+            return result, calls, content
+
+        account = hashlib.blake2b(self.api_key.encode(), digest_size=16).hexdigest()
+        key = (home, session_scope, account, str(_model_id(model)))
+        session = _lease_session(key)
+        if session is None:
+            # ponytail: concurrent turns bypass shared state instead of queueing or corrupting it.
+            prompt, allowed_names = render_prompt(
+                messages, tools=tools, tool_choice=tool_choice
+            )
+            result = self._run_ephemeral(
+                bridge=bridge,
+                prompt=prompt,
+                images=extract_images(messages),
+                model=model,
+                timeout=timeout,
+            )
+            calls, content = extract_tool_calls(
+                str(getattr(result, "result", "") or ""), allowed_names
+            )
+            return result, calls, content
+
+        try:
+            extends = (
+                session.agent is not None
+                and len(incoming) == len(messages)
+                and len(incoming) > len(session.history)
+                and incoming[: len(session.history)] == session.history
+            )
+            if session.agent is not None and not extends:
+                with suppress(Exception):
+                    session.agent.close()
+                session.agent = None
+                session.history.clear()
+
+            offset = len(session.history) if extends else 0
+            request_messages = messages[offset:]
+            if session.agent is None:
+                session.agent = self._create_agent(
+                    bridge=bridge,
+                    cwd=session.cwd,
+                    model=model,
+                    timeout=timeout,
+                )
+            prompt, allowed_names = render_prompt(
+                request_messages, tools=tools, tool_choice=tool_choice
+            )
+            result = self._run_agent(
+                session.agent,
+                prompt=prompt,
+                images=extract_images(request_messages),
+            )
+            calls, content = extract_tool_calls(
+                str(getattr(result, "result", "") or ""), allowed_names
+            )
+            session.history = incoming + [_assistant_history(content, calls)]
+            return result, calls, content
+        except Exception:
+            if session.agent is not None:
+                with suppress(Exception):
+                    session.agent.close()
+            session.agent = None
+            session.history.clear()
+            raise
+        finally:
+            _release_session(session)
 
     def _create_chat_completion(
         self,
@@ -461,19 +754,17 @@ class CursorSDKClient:
         tool_choice: Any = None,
         stream: bool = False,
         timeout: Any = None,
+        _cursor_session_scope: str | None = None,
         **_: Any,
     ) -> Any:
-        prompt, allowed_names = render_prompt(
-            messages or [], tools=tools, tool_choice=tool_choice
-        )
-        result = self._run_sdk(
-            prompt=prompt,
-            images=extract_images(messages or []),
+        result, calls, content = self._execute(
             model=model,
+            messages=messages or [],
+            tools=tools,
+            tool_choice=tool_choice,
             timeout=_timeout_seconds(timeout),
+            session_scope=str(_cursor_session_scope or "").strip(),
         )
-        response_text = str(getattr(result, "result", "") or "")
-        calls, content = extract_tool_calls(response_text, allowed_names)
         completion = SimpleNamespace(
             id=f"chatcmpl-cursor-{uuid.uuid4().hex}",
             object="chat.completion",

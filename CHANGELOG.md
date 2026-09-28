@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Retains one official SDK agent per Hermes conversation/account/model and sends only appended transcript messages.
+- Shares one warm SDK bridge per Hermes profile process and preserves retained agents across Hermes client rebuilds.
+- Adds an idle-session LRU target, profile/account/model isolation, safe rewrite resets, concurrent-turn isolation, and process-exit cleanup without destructive SDK deletion.
+- Documents Cursor cache semantics and exposes `HERMES_CURSOR_MAX_SESSIONS` (default 16).
+
 ## 0.2.1
 
 - Always passes Cursor's documented `auto` model explicitly; local SDK agents reject an omitted model.

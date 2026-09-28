@@ -35,6 +35,15 @@ class CursorProfile(ProviderProfile):
             return None
         return models or None
 
+    def build_api_kwargs_extras(
+        self,
+        *,
+        reasoning_config: dict | None = None,
+        **context: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        scope = str(context.get("cache_scope_id") or context.get("session_id") or "").strip()
+        return ({}, {"_cursor_session_scope": scope}) if scope else ({}, {})
+
 
 profile = CursorProfile(
     name="cursor",

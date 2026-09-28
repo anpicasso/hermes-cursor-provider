@@ -10,10 +10,10 @@ It uses Cursor's official [`cursor-sdk`](https://cursor.com/docs/sdk/python) pac
 - Uses `CURSOR_API_KEY` through Hermes' normal API-key credential flow.
 - Lists account-visible models through the official SDK.
 - Converts Hermes chat history, images, and tool schemas into SDK agent requests.
-- Disables Cursor built-in tools and MCP servers, runs the SDK in an isolated temporary workspace, and accepts only tool names offered by Hermes.
+- Disables Cursor built-in tools and MCP servers, runs the SDK in private sandboxed workspaces, and accepts only tool names offered by Hermes.
 - Returns OpenAI-shaped sync/async responses so Hermes retains its normal conversation, approval, and tool loop.
 
-Cursor's SDK is an agent surface, not a raw chat-completions API. This plugin deliberately uses one isolated SDK agent run per Hermes model call and translates explicit `<tool_call>` blocks back into Hermes tool calls; SDK custom tools are not used because they would execute outside Hermes' approval path.
+Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools are not used because they would execute outside Hermes' approval path.
 
 ## Install
 
@@ -51,8 +51,8 @@ Version 0.2 removes the private `api2.cursor.sh` protocol, browser-token OAuth f
 ## Security model
 
 - Credentials are passed only to the official SDK; custom provider URLs are rejected before bridge launch.
-- The bundled bridge listens on loopback and is owned/closed by the SDK client.
-- Every SDK agent gets a private temporary workspace with sandboxing enabled.
+- One SDK-owned loopback bridge is shared per Hermes profile process and closed at process exit.
+- Every retained SDK agent gets a private sandboxed workspace. Sessions are isolated by Hermes profile, conversation, account-key digest, and model.
 - Cursor built-in tools and MCP servers are disabled. Hermes executes only allowlisted tool names through its own loop.
 - Only HTTPS or bounded `data:image/*;base64` image inputs are forwarded.
 
@@ -63,7 +63,9 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 - Cursor SDK `1.x` is proprietary beta software and may change; the plugin pins the supported major version.
 - Streaming is synthesized after the SDK run completes because the plugin preserves a simple OpenAI-compatible boundary.
 - Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop.
-- A fresh SDK agent is created for each Hermes call; the complete Hermes transcript is supplied each time.
+- Up to 16 idle conversation agents are retained per process by default (`HERMES_CURSOR_MAX_SESSIONS` changes the LRU target); active turns can temporarily exceed it. A history rewrite/compaction starts a fresh agent; concurrent turns on one conversation use an isolated one-shot agent.
+- Agent reuse ends on process restart. Cross-process SDK resume is deliberately not enabled yet.
+- Cursor reports cache reads through usage metadata, but only a real authenticated run can measure the resulting hit rate.
 - Live inference needs a real Cursor API key and is not exercised by the public CI suite.
 
 ## Development
