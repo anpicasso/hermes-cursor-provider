@@ -15,10 +15,10 @@ import threading
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable, cast
 
 CURSOR_API_URL = "https://api.cursor.com"
 _TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -614,7 +614,13 @@ class CursorSDKClient:
             run = agent.send({"text": prompt, "images": images})
             with self._runs_lock:
                 self._runs.add(run)
-            return run.wait()
+            iter_text = getattr(run, "iter_text", None)
+            parts = cast(Iterable[str], iter_text()) if callable(iter_text) else ()
+            streamed = "".join(part for part in parts if part)
+            result = run.wait()
+            if streamed and not getattr(result, "result", ""):
+                return replace(result, result=streamed)
+            return result
         except BaseException:
             if run is not None:
                 with suppress(Exception):

@@ -37,7 +37,12 @@ def main() -> None:
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested="cursor", target_model="auto")
+        runtime = resolve_runtime_provider(
+            requested="cursor",
+            explicit_api_key="offline-probe-token",
+            explicit_base_url="https://api.cursor.com",
+            target_model="auto",
+        )
         assert runtime["provider"] == "cursor"
         assert runtime["api_key"] == "offline-probe-token"
         assert runtime["base_url"] == "https://api.cursor.com"

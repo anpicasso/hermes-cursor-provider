@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -19,6 +20,14 @@ from hermes_cursor_provider.client import (
 )
 
 
+@dataclass
+class FakeResult:
+    result: str
+    model: object
+    usage: object
+    stream_text: str = ""
+
+
 class FakeRun:
     def __init__(self, result):
         self._result = result
@@ -26,6 +35,10 @@ class FakeRun:
 
     def wait(self):
         return self._result
+
+    def iter_text(self):
+        if self._result.stream_text:
+            yield self._result.stream_text
 
     def cancel(self):
         self.cancelled = True
@@ -61,7 +74,7 @@ class FakeCursorClient:
         self.messages = []
         self.agents = []
         self.closed = False
-        self.result = SimpleNamespace(
+        self.result = FakeResult(
             result="hello",
             model=SimpleNamespace(id="composer-2.5"),
             usage=SimpleNamespace(
@@ -187,6 +200,21 @@ def test_sync_completion_uses_official_bridge_with_no_cursor_tools():
         client.close()
     assert sdk.agents[0].closed
     assert not sdk.closed
+
+
+def test_completion_uses_streamed_text_when_wait_result_is_empty():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    sdk.result.stream_text = "streamed answer"
+    try:
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hello"}]
+        )
+    finally:
+        client.close()
+    assert response.choices[0].message.content == "streamed answer"
+    assert response.usage.total_tokens == 7
 
 
 def test_tool_call_and_sync_stream_are_openai_shaped():

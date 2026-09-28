@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- Reads assistant text from the official SDK run stream before collecting the terminal result. Local SDK runs can leave `RunResult.result` empty even when they emitted a valid answer; that previously looked like an empty model response and triggered Hermes fallback.
+
 ## 0.3.1
 
 - Stops requesting Cursor's optional local sandbox, which caused every SDK run to fail on unsupported hosts before Hermes fell back. Private per-agent working directories and the Hermes-owned tool boundary remain unchanged.
