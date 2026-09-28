@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Always passes Cursor's documented `auto` model explicitly; local SDK agents reject an omitted model.
+
 ## 0.2.0
 
 - Replaced the reverse-engineered Cursor Agent protocol with Cursor's official Python SDK and bundled bridge.

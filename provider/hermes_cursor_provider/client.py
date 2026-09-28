@@ -327,7 +327,9 @@ def _model_id(model: str | None) -> str | None:
         if value.lower().startswith(prefix):
             value = value[len(prefix):]
             break
-    return None if value.lower() in {"", "auto", "default"} else value
+    # Cursor requires an explicit model for local agents. ``auto`` is the
+    # documented server-selected fallback; ``default`` is only our alias.
+    return "auto" if value.lower() in {"", "auto", "default"} else value
 
 
 class _Completions:

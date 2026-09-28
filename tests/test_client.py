@@ -185,6 +185,7 @@ def test_tool_call_and_sync_stream_are_openai_shaped():
         client.close()
     assert chunks[0].choices[0].delta.tool_calls[0].function.name == "read_file"
     assert chunks[0].choices[0].finish_reason == "tool_calls"
+    assert sdk.options[0]["model"] == "auto"
     assert chunks[-1].choices == []
     assert chunks[-1].usage.total_tokens == 7
 
