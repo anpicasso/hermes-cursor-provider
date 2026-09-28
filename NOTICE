@@ -1,31 +1,14 @@
 # Third-party notices
 
-## Hermes Agent / PR #40876
+## Cursor SDK
 
-Protocol framing, request-shaping, OAuth-flow, and protobuf implementation evidence was adapted from code contributed to NousResearch/hermes-agent in pull request #40876. Hermes Agent is MIT licensed:
+This plugin depends on the separately distributed `cursor-sdk` Python package, currently declared as `cursor-sdk>=1.0.32,<2`. Cursor identifies that package and its bundled SDK bridge as proprietary software. Installation and use are governed by Cursor's SDK license and Terms of Service:
 
-Copyright (c) 2025 Nous Research
+- <https://cursor.com/docs/sdk/python>
+- <https://cursor.com/terms-of-service>
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+The Cursor SDK source and bridge are not copied into this repository; Hermes' plugin installer obtains the declared dependency from its package distributor.
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+## Hermes Agent
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-## oh-my-pi
-
-The request-shaping approach in PR #40876 states that it was ported from the oh-my-pi Cursor provider. oh-my-pi is MIT licensed:
-
-Copyright (c) 2025 Mario Zechner
-Copyright (c) 2025-2026 Can Bölük
-Copyright (c) 2026 Stencil Labs, Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-## Cursor protocol descriptor
-
-`provider/hermes_cursor_provider/cursor_protocol/agent_pb2.py` embeds a protobuf descriptor recovered in PR #40876 for Cursor's undocumented `agent.v1` service. The schema did not carry an independent license or provenance header. The repository includes it solely because the direct protocol cannot function without its message definitions. This implementation is unofficial and may implicate Cursor's contractual restrictions on reverse engineering; users must make their own legal and account-risk assessment.
+This plugin implements the public `ProviderProfile` model-provider seam from Hermes Agent. Hermes Agent is MIT licensed; no Hermes core files are modified or redistributed by this repository.

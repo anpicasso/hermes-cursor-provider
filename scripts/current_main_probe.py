@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import tempfile
-import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,34 +17,46 @@ def main() -> None:
         target.parent.mkdir(parents=True)
         shutil.copytree(ROOT / "provider", target)
         os.environ["HERMES_HOME"] = str(home)
+        os.environ["CURSOR_API_KEY"] = "offline-probe-token"
 
         import providers
+
         profile = providers.get_provider_profile("cursor")
         assert profile is not None
-        assert profile.auth_handler is not None
-        assert profile.refresh_credential is not None
-        assert profile.build_extra_body(session_id="probe") == {"_cursor_session_id": "probe"}
-
-        from agent.credential_pool import AUTH_TYPE_OAUTH, PooledCredential, load_pool
-        pool = load_pool("cursor")
-        pool.add_entry(PooledCredential(
-            provider="cursor", id=uuid.uuid4().hex[:6], label="probe",
-            auth_type=AUTH_TYPE_OAUTH, priority=0, source="manual:probe",
-            access_token="offline-probe-token", refresh_token="offline-probe-refresh",
-            base_url="https://api2.cursor.sh", inference_base_url="https://api2.cursor.sh",
-        ))
+        assert profile.auth_type == "api_key"
+        assert profile.auth_handler is None
+        assert profile.refresh_credential is None
+        assert profile.env_vars == ("CURSOR_API_KEY",)
 
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested="cursor", target_model="default")
+
+        runtime = resolve_runtime_provider(requested="cursor", target_model="auto")
         assert runtime["provider"] == "cursor"
         assert runtime["api_key"] == "offline-probe-token"
-        assert runtime["base_url"] == "https://api2.cursor.sh"
+        assert runtime["base_url"] == "https://api.cursor.com"
         assert runtime["api_mode"] == "chat_completions"
 
         client = profile.create_client(api_key=runtime["api_key"], base_url=runtime["base_url"])
+        assert client is not None
         assert client.chat.completions.create
         assert client.api_key == "offline-probe-token"
+        assert client.HERMES_SKIP_TRANSPORT_WRAP
+        assert client.HERMES_SKIP_ASYNC_WRAP
         client.close()
+
+        from agent.auxiliary_client import resolve_provider_client
+
+        aux_client, aux_model = resolve_provider_client(
+            "cursor",
+            model="auto",
+            async_mode=True,
+            explicit_api_key="offline-probe-token",
+            explicit_base_url="https://api.cursor.com",
+        )
+        assert aux_client is not None
+        assert aux_model == "auto"
+        assert aux_client.HERMES_SKIP_ASYNC_WRAP
+        aux_client.close()
 
         print(json.dumps({
             "ok": True,

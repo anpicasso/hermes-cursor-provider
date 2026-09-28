@@ -1,10 +1,8 @@
 name: cursor-provider
 kind: model-provider
-version: 0.1.0
+version: 0.2.0
 requires_hermes: ">=0.21.4"
-description: Native Cursor subscription provider using Hermes-owned tool execution.
+description: Cursor subscription provider using Cursor's official Python SDK.
 author: anpicasso
 python_dependencies:
-  - h2>=4.2,<5
-  - protobuf>=6.33.5,<7
-  - httpx>=0.28,<1
+  - cursor-sdk>=1.0.32,<2

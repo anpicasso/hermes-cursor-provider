@@ -1,114 +1,62 @@
-"""Standalone Cursor model-provider plugin for Hermes Agent current main."""
+"""Official Cursor SDK model-provider plugin for Hermes Agent."""
 from __future__ import annotations
 
-import threading
-import time
 from typing import Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
-from .hermes_cursor_provider.credentials import auth_handler, refresh_credential
-from .hermes_cursor_provider.cursor_protocol.constants import CURSOR_API_URL
+from .hermes_cursor_provider.client import CURSOR_API_URL
 
-_SEED_MODELS = (
-    "default",
-    "composer-2.5",
-    "claude-4.6-opus-high",
-    "claude-4.5-sonnet",
-    "gpt-5.4-medium",
-)
-_CATALOG = _SEED_MODELS
-_CATALOG_AT = 0.0
-_CATALOG_LOCK = threading.Lock()
-
-
-def _pool_token() -> str:
-    try:
-        from agent.credential_pool import load_pool
-        for entry in load_pool("cursor").entries():
-            if entry.access_token and entry.last_status != "dead":
-                return str(entry.access_token)
-    except Exception:
-        pass
-    return ""
-
-
-def _catalog(api_key: str = "", *, timeout: float = 12.0, force: bool = False) -> tuple[str, ...]:
-    global _CATALOG, _CATALOG_AT
-    if not force and time.monotonic() - _CATALOG_AT < 300:
-        return _CATALOG
-    if not _CATALOG_LOCK.acquire(blocking=False):
-        return _CATALOG
-    try:
-        token = (api_key or _pool_token()).strip()
-        if token:
-            try:
-                from .hermes_cursor_provider.cursor_protocol.catalog import fetch_cursor_usable_models
-                live = tuple(fetch_cursor_usable_models(api_key=token, timeout=timeout))
-                if live:
-                    _CATALOG = live
-            except Exception:
-                pass
-        _CATALOG_AT = time.monotonic()
-        return _CATALOG
-    finally:
-        _CATALOG_LOCK.release()
+_SEED_MODELS = ("auto", "composer-2.5")
 
 
 class CursorProfile(ProviderProfile):
-    @property
-    def fallback_models(self) -> tuple[str, ...]:
-        # Core reads this during picker rendering; never block the UI on discovery.
-        return _CATALOG
-
-    @fallback_models.setter
-    def fallback_models(self, value: tuple[str, ...]) -> None:
-        global _CATALOG
-        _CATALOG = tuple(value or _SEED_MODELS)
-
     def create_client(self, **kwargs: Any):
-        from .hermes_cursor_provider.client import CursorClient
-        return CursorClient(**kwargs)
+        from .hermes_cursor_provider.client import CursorSDKClient
+
+        return CursorSDKClient(**kwargs)
 
     def fetch_models(
         self,
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = 12.0,
+        timeout: float = 8.0,
     ) -> list[str] | None:
-        # The protocol endpoint is fixed; never forward a bearer token to a custom URL.
+        # Never forward a Cursor key through a caller-supplied endpoint.
         if base_url and str(base_url).rstrip("/") != CURSOR_API_URL:
             return None
-        return list(_catalog(api_key or "", timeout=timeout, force=True))
+        try:
+            from .hermes_cursor_provider.client import list_cursor_models
 
-    def build_extra_body(self, *, session_id: str | None = None, **context: Any) -> dict[str, Any]:
-        del context
-        return {"_cursor_session_id": session_id} if session_id else {}
+            models = list_cursor_models(api_key=api_key or "", timeout=timeout)
+        except Exception:
+            return None
+        return models or None
 
 
 profile = CursorProfile(
     name="cursor",
-    aliases=("cursor-agent", "cursor-subscription"),
-    display_name="Cursor (native)",
-    description="Cursor subscription through the private Agent protocol; Hermes owns tool execution.",
-    signup_url="https://cursor.com",
+    aliases=("cursor-sdk", "cursor-subscription"),
+    display_name="Cursor SDK",
+    description="Cursor subscription through the official Python SDK; Hermes owns tool execution.",
+    signup_url="https://cursor.com/dashboard/api",
     api_mode="chat_completions",
     base_url=CURSOR_API_URL,
-    hostname="api2.cursor.sh",
-    auth_type="oauth_external",
-    auth_handler=auth_handler,
-    refresh_credential=refresh_credential,
+    hostname="api.cursor.com",
+    auth_type="api_key",
+    env_vars=("CURSOR_API_KEY",),
     supports_health_check=False,
     supports_model_listing=True,
-    supports_vision=False,
+    supports_vision=True,
     fallback_models=_SEED_MODELS,
-    model_aliases={"auto": "default", "composer": "composer-2.5"},
+    model_aliases={"default": "auto", "composer": "composer-2.5"},
     model_capabilities={
-        model: {"supports_vision": False, "supports_tools": True, "context_window": 200000}
+        model: {"supports_vision": True, "supports_tools": True}
         for model in _SEED_MODELS
     },
-    default_aux_model="default",
+    default_aux_model="auto",
+    unsupported_response_formats=("json_schema", "json_object"),
 )
 register_provider(profile)

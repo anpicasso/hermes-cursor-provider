@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - run: pip install 'h2>=4.2,<5' 'protobuf>=6.33.5,<7' 'httpx>=0.28,<1' pytest
+      - run: pip install 'cursor-sdk>=1.0.32,<2' pytest
       - run: pytest -q
       - run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
       - run: pip install -e "$RUNNER_TEMP/hermes-agent"
