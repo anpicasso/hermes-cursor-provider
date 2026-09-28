@@ -26,6 +26,16 @@ _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
 
 
+class CursorSDKRunError(RuntimeError):
+    """A terminal Cursor SDK run failure with Hermes-readable status."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        lowered = message.lower()
+        self.status_code = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
+        self.error_code = "cursor_sdk_run_failed"
+
+
 def _plain(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _plain(item) for key, item in value.items()}
@@ -614,10 +624,34 @@ class CursorSDKClient:
             run = agent.send({"text": prompt, "images": images})
             with self._runs_lock:
                 self._runs.add(run)
-            iter_text = getattr(run, "iter_text", None)
-            parts = cast(Iterable[str], iter_text()) if callable(iter_text) else ()
-            streamed = "".join(part for part in parts if part)
+            streamed_parts: list[str] = []
+            failure = ""
+            stream = getattr(run, "stream", None)
+            if callable(stream):
+                for event in cast(Iterable[Any], stream()):
+                    kind = str(getattr(event, "type", ""))
+                    payload = getattr(event, "message", None)
+                    if kind == "assistant":
+                        for block in getattr(payload, "content", ()) or ():
+                            text = str(getattr(block, "text", "") or "")
+                            if text:
+                                streamed_parts.append(text)
+                    elif kind == "status":
+                        status = str(getattr(payload, "status", "") or "").upper()
+                        if status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                            failure = str(getattr(payload, "message", "") or status)
+            else:
+                iter_text = getattr(run, "iter_text", None)
+                if callable(iter_text):
+                    streamed_parts.extend(
+                        part for part in cast(Iterable[str], iter_text()) if part
+                    )
             result = run.wait()
+            status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
+            status = str(status_value or "").upper()
+            if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
+            streamed = "".join(streamed_parts)
             if streamed and not getattr(result, "result", ""):
                 return replace(result, result=streamed)
             return result

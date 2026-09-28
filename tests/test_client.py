@@ -26,6 +26,8 @@ class FakeResult:
     model: object
     usage: object
     stream_text: str = ""
+    status: str = "FINISHED"
+    status_message: str = ""
 
 
 class FakeRun:
@@ -36,9 +38,22 @@ class FakeRun:
     def wait(self):
         return self._result
 
-    def iter_text(self):
+    def stream(self):
         if self._result.stream_text:
-            yield self._result.stream_text
+            yield SimpleNamespace(
+                type="assistant",
+                message=SimpleNamespace(
+                    content=[SimpleNamespace(text=self._result.stream_text)]
+                ),
+            )
+        if self._result.status != "FINISHED":
+            yield SimpleNamespace(
+                type="status",
+                message=SimpleNamespace(
+                    status=self._result.status,
+                    message=self._result.status_message,
+                ),
+            )
 
     def cancel(self):
         self.cancelled = True
@@ -215,6 +230,22 @@ def test_completion_uses_streamed_text_when_wait_result_is_empty():
         client.close()
     assert response.choices[0].message.content == "streamed answer"
     assert response.usage.total_tokens == 7
+
+
+def test_terminal_sdk_error_is_not_misreported_as_empty_success():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    sdk.result.status = "ERROR"
+    sdk.result.status_message = "You're out of usage. Switch to Auto."
+    try:
+        with pytest.raises(RuntimeError, match="out of usage") as exc_info:
+            client.chat.completions.create(
+                model="composer-2.5", messages=[{"role": "user", "content": "hello"}]
+            )
+    finally:
+        client.close()
+    assert exc_info.value.status_code == 429
 
 
 def test_tool_call_and_sync_stream_are_openai_shaped():

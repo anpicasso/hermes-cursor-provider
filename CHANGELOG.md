@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3
+
+- Surfaces terminal Cursor SDK failures (including exhausted model usage) as real provider errors instead of empty successful responses, so Hermes logs the Cursor reason before applying its configured fallback.
+
 ## 0.3.2
 
 - Reads assistant text from the official SDK run stream before collecting the terminal result. Local SDK runs can leave `RunResult.result` empty even when they emitted a valid answer; that previously looked like an empty model response and triggered Hermes fallback.
