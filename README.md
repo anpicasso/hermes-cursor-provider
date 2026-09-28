@@ -66,7 +66,7 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 - Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop.
 - Up to 16 idle conversation agents are retained per process by default (`HERMES_CURSOR_MAX_SESSIONS` changes the LRU target); active turns can temporarily exceed it. A history rewrite/compaction starts a fresh agent; concurrent turns on one conversation use an isolated one-shot agent.
 - Agent reuse ends on process restart. Cross-process SDK resume is deliberately not enabled yet.
-- Cursor reports cache reads through usage metadata, but only a real authenticated run can measure the resulting hit rate.
+- Cursor cache reads and writes are reported through Hermes usage metadata; Cursor's billed `Agent.get_usage()` endpoint may remain unavailable for some accounts.
 - Live inference needs a real Cursor API key and is not exercised by the public CI suite.
 
 ## Development

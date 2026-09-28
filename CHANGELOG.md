@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+
+- Reports Cursor SDK cache-write tokens to Hermes and maps Cursor's meter-sum `total_tokens` to the OpenAI-compatible prompt-plus-completion total.
+
 ## 0.3.3
 
 - Surfaces terminal Cursor SDK failures (including exhausted model usage) as real provider errors instead of empty successful responses, so Hermes logs the Cursor reason before applying its configured fallback.

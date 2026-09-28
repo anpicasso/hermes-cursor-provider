@@ -293,12 +293,15 @@ def _usage(result: Any) -> Any:
     prompt = int(getattr(usage, "input_tokens", 0) or 0)
     completion = int(getattr(usage, "output_tokens", 0) or 0)
     cached = int(getattr(usage, "cache_read_tokens", 0) or 0)
-    total = int(getattr(usage, "total_tokens", 0) or prompt + completion)
+    written = int(getattr(usage, "cache_write_tokens", 0) or 0)
     return SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
-        total_tokens=total,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+        total_tokens=prompt + completion,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=cached,
+            cache_write_tokens=written,
+        ),
     )
 
 

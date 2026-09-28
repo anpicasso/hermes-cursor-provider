@@ -96,7 +96,8 @@ class FakeCursorClient:
                 input_tokens=4,
                 output_tokens=2,
                 cache_read_tokens=1,
-                total_tokens=7,
+                cache_write_tokens=2,
+                total_tokens=9,
             ),
         )
         self.__class__.instances.append(self)
@@ -209,7 +210,10 @@ def test_sync_completion_uses_official_bridge_with_no_cursor_tools():
         assert sdk.messages[0]["text"].endswith("Continue from the final transcript entry.")
         assert response.choices[0].message.content == "hello"
         assert response.choices[0].finish_reason == "stop"
-        assert response.usage.total_tokens == 7
+        assert response.usage.prompt_tokens == 4
+        assert response.usage.total_tokens == 6
+        assert response.usage.prompt_tokens_details.cached_tokens == 1
+        assert response.usage.prompt_tokens_details.cache_write_tokens == 2
         assert sdk.timeout_options["timeout"] == 15
     finally:
         client.close()
@@ -229,7 +233,7 @@ def test_completion_uses_streamed_text_when_wait_result_is_empty():
     finally:
         client.close()
     assert response.choices[0].message.content == "streamed answer"
-    assert response.usage.total_tokens == 7
+    assert response.usage.total_tokens == 6
 
 
 def test_terminal_sdk_error_is_not_misreported_as_empty_success():
@@ -262,7 +266,7 @@ def test_tool_call_and_sync_stream_are_openai_shaped():
     assert chunks[0].choices[0].finish_reason == "tool_calls"
     assert sdk.options[0]["model"] == "auto"
     assert chunks[-1].choices == []
-    assert chunks[-1].usage.total_tokens == 7
+    assert chunks[-1].usage.total_tokens == 6
 
 
 def test_async_completion_and_stream():
