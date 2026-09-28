@@ -176,7 +176,7 @@ def test_sync_completion_uses_official_bridge_with_no_cursor_tools():
         assert options["model"] == "composer-2.5"
         assert options["tools"] == []
         assert options["mcp_servers"] == {}
-        assert options["local"]["sandbox_options"] == {"enabled": True}
+        assert "sandbox_options" not in options["local"]
         assert not Path(options["local"]["cwd"]).exists()
         assert sdk.messages[0]["text"].endswith("Continue from the final transcript entry.")
         assert response.choices[0].message.content == "hello"

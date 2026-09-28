@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Stops requesting Cursor's optional local sandbox, which caused every SDK run to fail on unsupported hosts before Hermes fell back. Private per-agent working directories and the Hermes-owned tool boundary remain unchanged.
+
 ## 0.3.0
 
 - Retains one official SDK agent per Hermes conversation/account/model and sends only appended transcript messages.
@@ -16,7 +20,7 @@
 - Replaced the reverse-engineered Cursor Agent protocol with Cursor's official Python SDK and bundled bridge.
 - Replaced browser-token OAuth with `CURSOR_API_KEY`, enabling official subscription-backed SDK usage and Hermes auxiliary routing.
 - Removed vendored protobuf, HTTP/2 framing, private endpoints, token refresh code, and CLI impersonation.
-- Added isolated sandboxed workspaces, disabled Cursor built-in tools/MCP, allowlisted Hermes tool-call translation, vision inputs, official model discovery, and sync/async client support.
+- Added isolated per-agent workspaces, disabled Cursor built-in tools/MCP, allowlisted Hermes tool-call translation, vision inputs, official model discovery, and sync/async client support.
 - Reworked documentation, security model, tests, and current-main verification for the SDK architecture.
 
 ## 0.1.0

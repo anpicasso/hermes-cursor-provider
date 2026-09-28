@@ -599,10 +599,7 @@ class CursorSDKClient:
         )
         options: dict[str, Any] = {
             "api_key": self.api_key,
-            "local": {
-                "cwd": str(cwd),
-                "sandbox_options": {"enabled": True},
-            },
+            "local": {"cwd": str(cwd)},
             "mcp_servers": {},
             "tools": [],
         }
