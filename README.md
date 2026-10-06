@@ -62,7 +62,7 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 
 - Cursor SDK `1.x` is proprietary beta software and may change; the plugin pins the supported major version.
 - The plugin does not request Cursor's optional local sandbox because the SDK rejects it on unsupported hosts. Security does not depend on that sandbox: Cursor built-in tools, custom tools, and MCP servers remain disabled, and Hermes owns tool execution.
-- Streaming is synthesized after the SDK run completes because the plugin preserves a simple OpenAI-compatible boundary. Since 0.3.5, a lazy stream supports both Hermes Relay's synchronous iteration and async auxiliary consumers without running SDK work on their event loop.
+- Text streams incrementally from the SDK to Hermes, including managed Relay and async auxiliary consumers. Only incomplete tool-call blocks and trailing whitespace are held back; validated tool calls remain under Hermes' execution and approval loop. Usage and the finish marker arrive when the SDK run ends. A terminal-only SDK response cannot provide earlier text.
 - Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop.
 - Up to 16 idle conversation agents are retained per process by default (`HERMES_CURSOR_MAX_SESSIONS` changes the LRU target); active turns can temporarily exceed it. A history rewrite/compaction starts a fresh agent; concurrent turns on one conversation use an isolated one-shot agent.
 - Agent reuse ends on process restart. Cross-process SDK resume is deliberately not enabled yet.

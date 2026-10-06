@@ -13,13 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 def verify_managed_stream(profile) -> None:
     """Exercise the real Relay consumer, not only provider registration."""
     from types import SimpleNamespace
+    import threading
     from agent import relay_llm, relay_runtime
     from agent.chat_completion_helpers_relay import RelayChatAccumulator
 
     client = profile.create_client(api_key="offline-probe-token")
     calls = []
+    allow_finish = threading.Event()
+    completed = threading.Event()
 
-    def execute(**kwargs):
+    def send(message):
         import asyncio
         try:
             asyncio.get_running_loop()
@@ -27,10 +30,23 @@ def verify_managed_stream(profile) -> None:
             pass
         else:
             raise AssertionError("SDK work must run off the Relay event loop")
-        calls.append(kwargs)
-        return SimpleNamespace(usage=None), [], "relay-ok"
+        calls.append(message)
+        return Run()
 
-    client._execute = execute
+    class Run:
+        def stream(self):
+            yield SimpleNamespace(type="assistant", message=SimpleNamespace(content=[SimpleNamespace(text="relay-")]))
+            assert allow_finish.wait(5), "Relay withheld text until completion"
+            yield SimpleNamespace(type="assistant", message=SimpleNamespace(content=[SimpleNamespace(text="ok")]))
+
+        def wait(self):
+            completed.set()
+            return SimpleNamespace(result="relay-ok", status="FINISHED", usage=None)
+
+        def cancel(self):
+            allow_finish.set()
+
+    client._create_agent = lambda **kw: SimpleNamespace(send=send, close=lambda: None)
     coordinator = relay_runtime.SESSION_COORDINATOR
     lease = coordinator.acquire_conversation(
         profile_key=relay_runtime.current_profile_key(), session_id="relay-probe", platform="cli")
@@ -47,11 +63,16 @@ def verify_managed_stream(profile) -> None:
             completed_response_predicate=lambda value: hasattr(value, "choices"),
             metadata={"api_mode": "chat_completions"},
         )
-        chunks = list(stream)
-        assert chunks[0].choices[0].delta.content == "relay-ok"
+        first = next(iter(stream))
+        assert first.choices[0].delta.content == "relay-"
+        assert not completed.is_set()
+        allow_finish.set()
+        chunks = [first, *stream]
+        assert "".join(c.choices[0].delta.content or "" for c in chunks if c.choices) == "relay-ok"
         assert chunks[-1].usage.total_tokens == 0
         assert len(calls) == 1
     finally:
+        allow_finish.set()
         if stream is not None:
             stream.close()
         client.close()

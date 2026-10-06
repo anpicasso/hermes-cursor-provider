@@ -5,6 +5,7 @@ import base64
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,17 @@ class FakeResult:
     status_message: str = ""
 
 
+def _assistant_event(text):
+    return SimpleNamespace(
+        type="assistant",
+        message=SimpleNamespace(content=[SimpleNamespace(text=text)]),
+    )
+
+
+def _status_event(status, message=""):
+    return SimpleNamespace(type="status", status=status, message=message)
+
+
 class FakeRun:
     def __init__(self, result):
         self._result = result
@@ -40,23 +52,32 @@ class FakeRun:
 
     def stream(self):
         if self._result.stream_text:
-            yield SimpleNamespace(
-                type="assistant",
-                message=SimpleNamespace(
-                    content=[SimpleNamespace(text=self._result.stream_text)]
-                ),
-            )
+            yield _assistant_event(self._result.stream_text)
         if self._result.status != "FINISHED":
-            yield SimpleNamespace(
-                type="status",
-                message=SimpleNamespace(
-                    status=self._result.status,
-                    message=self._result.status_message,
-                ),
-            )
+            yield _status_event(self._result.status, self._result.status_message)
 
     def cancel(self):
         self.cancelled = True
+
+
+class ScriptedRun(FakeRun):
+    """FakeRun with a scripted stream; callables run during iteration and may block."""
+
+    def __init__(self, result, script):
+        super().__init__(result)
+        self.script = list(script)
+        self.cancel_event = threading.Event()
+
+    def stream(self):
+        for item in self.script:
+            if callable(item):
+                item = item(self)
+            if item is not None:
+                yield item
+
+    def cancel(self):
+        super().cancel()
+        self.cancel_event.set()
 
 
 class FailingRun(FakeRun):
@@ -146,6 +167,46 @@ def _tool(name="read_file"):
             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
         },
     }
+
+
+def _stream_text(chunks):
+    return "".join(
+        chunk.choices[0].delta.content or ""
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].delta.content
+    )
+
+
+def _stream_calls(chunks):
+    return [
+        call
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].delta.tool_calls
+        for call in chunk.choices[0].delta.tool_calls
+    ]
+
+
+def _scripted_run(sdk, script):
+    run = ScriptedRun(sdk.result, script)
+    agent = FakeAgent(sdk)
+    agent.send = lambda message: run
+    sdk.create_agent = lambda options: agent
+    return run
+
+
+def _collect_scripted(client, sdk, text, split, tools_list=None):
+    sdk.result.result = text
+    sdk.result.stream_text = ""
+    run = _scripted_run(sdk, [_assistant_event(text[:split]), _assistant_event(text[split:])])
+    chunks = list(
+        client.chat.completions.create(
+            model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools_list if tools_list is not None else [_tool()],
+            stream=True,
+        )
+    )
+    return run, _stream_calls(chunks), _stream_text(chunks)
 
 
 def test_prompt_keeps_hermes_authoritative_and_filters_tool_choice():
@@ -262,8 +323,14 @@ def test_tool_call_and_sync_stream_are_openai_shaped():
         ))
     finally:
         client.close()
-    assert chunks[0].choices[0].delta.tool_calls[0].function.name == "read_file"
-    assert chunks[0].choices[0].finish_reason == "tool_calls"
+    calls = _stream_calls(chunks)
+    assert calls[0].function.name == "read_file"
+    finish = [
+        chunk.choices[0].finish_reason
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].finish_reason
+    ]
+    assert finish == ["tool_calls"]
     assert sdk.options[0]["model"] == "auto"
     assert chunks[-1].choices == []
     assert chunks[-1].usage.total_tokens == 6
@@ -379,6 +446,38 @@ def test_session_tool_continuation_reuses_agent_without_replaying_history():
     assert len(sdk.agents[0].messages) == 2
     assert '"content":"file-data"' in sdk.agents[0].messages[1]["text"]
     assert "inspect-x" not in sdk.agents[0].messages[1]["text"]
+
+
+def test_streamed_turn_updates_session_and_continuation_sends_only_delta():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "first-answer"
+    stream = client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "first-user"}],
+        stream=True,
+        _cursor_session_scope="scope-stream-continue",
+    )
+    chunks = list(stream)
+    assert _stream_text(chunks) == "first-answer"
+
+    sdk.result.result = "second-answer"
+    client.chat.completions.create(
+        model="auto",
+        messages=[
+            {"role": "user", "content": "first-user"},
+            {"role": "assistant", "content": "first-answer"},
+            {"role": "user", "content": "second-user"},
+        ],
+        _cursor_session_scope="scope-stream-continue",
+    )
+    client.close()
+
+    sdk = FakeCursorClient.instances[0]
+    assert len(sdk.agents) == 1
+    assert len(sdk.agents[0].messages) == 2
+    assert '"content":"second-user"' in sdk.agents[0].messages[1]["text"]
+    assert '"content":"first-user"' not in sdk.agents[0].messages[1]["text"]
 
 
 def test_session_isolates_scope_account_and_model():
@@ -528,9 +627,397 @@ def test_failed_wait_cancels_in_flight_run():
     failed = FailingRun(agent.owner.result)
     agent.send = lambda message: failed
     with pytest.raises(TimeoutError, match="run timed out"):
-        client._run_agent(agent, prompt="hello", images=[])
+        list(client._run_agent(agent, prompt="hello", images=[], allowed_names=set()))
     assert failed.cancelled
     assert failed not in client._runs
+
+
+def test_stream_yields_first_chunk_before_run_completes():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    gate = threading.Event()
+
+    def finish_text(run):
+        # The SDK run is still in flight here; the test only opens the gate
+        # after it has received the first chunk.
+        assert gate.wait(10)
+        return _assistant_event("lo")
+
+    run = _scripted_run(sdk, [_assistant_event("hel"), finish_text])
+    stream = client.chat.completions.create(model="auto", messages=[], stream=True)
+    iterator = iter(stream)
+    holder = {}
+
+    def pull_first():
+        holder["chunk"] = next(iterator, None)
+
+    worker = threading.Thread(target=pull_first, daemon=True)
+    worker.start()
+    try:
+        worker.join(2)
+        assert not worker.is_alive(), "no chunk arrived before the SDK run completed"
+        assert holder["chunk"].choices[0].delta.content == "hel"
+        gate.set()
+        rest = list(iterator)
+    finally:
+        gate.set()
+        client.close()
+        worker.join(5)
+    assert _stream_text([holder["chunk"]]) + _stream_text(rest) == "hello"
+
+
+def test_stream_splits_tool_block_at_arbitrary_boundaries():
+    text = (
+        'intro <tool_call>{"id":"c1","type":"function","function":{"name":"read_file",'
+        '"arguments":"{\\"path\\":\\"a.txt\\"}"}}</tool_call> outro'
+    )
+    expected_calls, expected_content = extract_tool_calls(text, {"read_file"})
+    assert expected_calls and expected_content == "intro  outro"
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        for split in range(len(text) + 1):
+            _, calls, content = _collect_scripted(client, sdk, text, split)
+            assert [call.function.name for call in calls] == ["read_file"], split
+            assert calls[0].function.arguments == expected_calls[0].function.arguments, split
+            assert content == expected_content, (split, content)
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        '<tool_call>{"function":{"name":"shell","arguments":"{}"}}</tool_call>',
+        '<tool_call>{"function":{"name":"read_file","arguments":"not-json"}}</tool_call>',
+    ],
+)
+def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block):
+    text = f"before {block} after"
+    expected_calls, expected_content = extract_tool_calls(text, {"read_file"})
+    assert expected_calls == [] and "tool_call" in expected_content
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        for split in (len("before <tool"), len(text) // 2, len(text) - 1):
+            _, calls, content = _collect_scripted(client, sdk, text, split)
+            assert calls == [], split
+            assert content == expected_content, (split, content)
+    finally:
+        client.close()
+
+
+def test_stream_does_not_repeat_terminal_text_already_streamed():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello world"  # run.wait() repeats the streamed concatenation
+    _scripted_run(sdk, [_assistant_event("hello "), _assistant_event("world")])
+    try:
+        chunks = list(client.chat.completions.create(model="auto", messages=[], stream=True))
+    finally:
+        client.close()
+    assert _stream_text(chunks) == "hello world"
+
+
+def test_stream_falls_back_to_terminal_result_when_no_fragments_arrive():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "terminal only"
+    sdk.result.stream_text = ""
+    try:
+        chunks = list(client.chat.completions.create(model="auto", messages=[], stream=True))
+    finally:
+        client.close()
+    assert _stream_text(chunks) == "terminal only"
+    assert chunks[-1].usage.total_tokens == 6
+
+
+def test_stream_late_error_raises_and_clears_session():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    sdk.result.status_message = "You're out of usage. Switch to Auto."
+    run = _scripted_run(
+        sdk,
+        [
+            _assistant_event("partial"),
+            _status_event("ERROR", "You're out of usage. Switch to Auto."),
+        ],
+    )
+    stream = client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        _cursor_session_scope="scope-late-error",
+    )
+    seen = []
+    try:
+        with pytest.raises(client_module.CursorSDKRunError, match="out of usage") as exc_info:
+            for chunk in stream:
+                seen.append(chunk)
+    finally:
+        client.close()
+    assert exc_info.value.status_code == 429
+    assert _stream_text(seen) == "partial"
+    assert not any(chunk.choices and chunk.choices[0].finish_reason for chunk in seen)
+    session = next(iter(client_module._SESSIONS.values()))
+    assert session.agent is None and session.history == []
+    assert not session.lock.locked()
+    assert run not in client._runs
+
+
+def test_close_after_first_delta_cancels_in_flight_run():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    blocked = threading.Event()
+
+    def block_until_cancelled(run):
+        blocked.set()
+        run.cancel_event.wait(10)
+        return _status_event("CANCELLED", "offline cancelled run")
+
+    run = _scripted_run(sdk, [_assistant_event("first"), block_until_cancelled])
+    stream = client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        _cursor_session_scope="scope-close",
+    )
+    iterator = iter(stream)
+    first = next(iterator)
+    assert first.choices[0].delta.content == "first"
+    drained = []
+
+    def pull_rest():
+        try:
+            drained.append(list(iterator))
+        except BaseException as exc:  # noqa: BLE001 - recorded for assertions
+            drained.append(exc)
+
+    worker = threading.Thread(target=pull_rest, daemon=True)
+    worker.start()
+    try:
+        assert blocked.wait(5), "worker never reached the blocked stream read"
+        stream.close()
+        worker.join(5)
+        assert not worker.is_alive()
+    finally:
+        stream.close()
+        client.close()
+        worker.join(5)
+    assert run.cancelled
+    assert isinstance(drained[0], client_module.CursorSDKRunError)
+    assert list(stream) == []  # a closed stream never starts a second run
+    session = next(iter(client_module._SESSIONS.values()))
+    assert session.agent is None and session.history == []
+    assert not session.lock.locked()
+
+
+def test_async_stream_cancellation_cancels_run_and_releases_session():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    blocked = threading.Event()
+
+    def block_until_cancelled(run):
+        blocked.set()
+        run.cancel_event.wait(10)
+        return _status_event("CANCELLED", "offline cancelled run")
+
+    run = _scripted_run(sdk, [_assistant_event("first"), block_until_cancelled])
+
+    async def scenario():
+        stream = client.chat.completions.create(
+            model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            _cursor_session_scope="scope-async-cancel",
+        )
+        stream = await stream
+        seen = []
+
+        async def consume():
+            async for chunk in stream:
+                seen.append(chunk)
+
+        task = asyncio.create_task(consume())
+        assert await asyncio.to_thread(blocked.wait, 5), "async pull never reached the blocked read"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return seen
+
+    try:
+        seen = asyncio.run(scenario())
+    finally:
+        client.close()
+    assert seen and seen[0].choices[0].delta.content == "first"
+    assert run.cancelled
+    session = next(iter(client_module._SESSIONS.values()))
+    deadline = time.monotonic() + 5
+    while (session.agent is not None or session.lock.locked()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session.agent is None and session.history == []
+    assert not session.lock.locked()
+
+
+def test_stream_emits_plain_text_before_an_incomplete_tool_block_completes():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    text = (
+        'answer <tool_call>{"id":"c1","function":{"name":"read_file",'
+        '"arguments":"{}"}}</tool_call> done'
+    )
+    sdk.result.result = text
+    split = text.index("<tool_call>") + len("<tool_call>") + 3
+    gate = threading.Event()
+
+    def finish_block(run):
+        assert gate.wait(10)  # the tool block is still incomplete here
+        return _assistant_event(text[split:])
+
+    _scripted_run(sdk, [_assistant_event(text[:split]), finish_block])
+    stream = client.chat.completions.create(
+        model="auto", messages=[], tools=[_tool()], stream=True
+    )
+    iterator = iter(stream)
+    holder = {}
+
+    def pull_first():
+        holder["chunk"] = next(iterator, None)
+
+    worker = threading.Thread(target=pull_first, daemon=True)
+    worker.start()
+    try:
+        worker.join(2)
+        assert not worker.is_alive(), "plain text was held until the tool block completed"
+        assert holder["chunk"].choices[0].delta.content == "answer"
+        assert not _stream_calls([holder["chunk"]])
+        gate.set()
+        rest = list(iterator)
+    finally:
+        gate.set()
+        client.close()
+        worker.join(5)
+    assert _stream_text([holder["chunk"]]) + _stream_text(rest) == "answer  done"
+    calls = _stream_calls(rest)
+    assert calls and calls[0].function.name == "read_file"
+
+
+def test_async_stream_aclose_after_first_chunk_cancels_run():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    blocked = threading.Event()
+
+    def block_until_cancelled(run):
+        blocked.set()
+        run.cancel_event.wait(10)
+        return _status_event("CANCELLED", "offline cancelled run")
+
+    run = _scripted_run(sdk, [_assistant_event("first"), block_until_cancelled])
+
+    async def scenario():
+        stream = await client.chat.completions.create(
+            model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            _cursor_session_scope="scope-aclose",
+        )
+        first = await stream.__aiter__().__anext__()
+        await stream.aclose()
+        return first
+
+    try:
+        first = asyncio.run(scenario())
+    finally:
+        client.close()
+    assert first.choices[0].delta.content == "first"
+    assert run.cancelled
+    session = next(iter(client_module._SESSIONS.values()))
+    deadline = time.monotonic() + 5
+    while (session.agent is not None or session.lock.locked()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session.agent is None and session.history == []
+    assert not session.lock.locked()
+
+
+def test_stream_tool_argument_can_contain_closing_tag():
+    import json
+    arguments = {"path": '</tool_call> and "quoted" \\ text'}
+    text = '<tool_call>' + json.dumps({"function": {"name": "read_file", "arguments": arguments}}) + '</tool_call>'
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        for split in range(len(text) + 1):
+            _, calls, content = _collect_scripted(client, sdk, text, split)
+            assert len(calls) == 1, (split, content)
+            assert json.loads(calls[0].function.arguments) == arguments
+            assert not content
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("close_target", ["stream", "client"])
+def test_close_during_send_cancels_new_run_and_releases_session(close_target):
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    started, release = threading.Event(), threading.Event()
+    run = ScriptedRun(sdk.result, [_assistant_event("late")])
+    agent = FakeAgent(sdk)
+
+    def send(message):
+        started.set()
+        assert release.wait(5)
+        return run
+
+    agent.send = send
+    sdk.create_agent = lambda options: agent
+    stream = client.chat.completions.create(model="auto", messages=[], stream=True, _cursor_session_scope="closing-send")
+    errors = []
+
+    def pull():
+        try:
+            next(iter(stream), None)
+        except client_module.CursorSDKRunError as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=pull)
+    worker.start()
+    try:
+        assert started.wait(2)
+        (stream if close_target == "stream" else client).close()
+        release.set()
+        worker.join(3)
+        assert not worker.is_alive()
+        assert run.cancelled
+        session = next(iter(client_module._SESSIONS.values()))
+        assert session.agent is None and not session.lock.locked()
+    finally:
+        release.set()
+        worker.join(5)
+        stream.close()
+        client.close()
+
+
+def test_await_stream_resolves_to_async_iterable_without_starting_run():
+    client = CursorSDKClient(api_key="crsr_test")
+
+    async def scenario():
+        stream = client.chat.completions.create(model="auto", messages=[], stream=True)
+        resolved = await stream
+        assert resolved is stream
+        assert FakeCursorClient.launches == []  # awaiting must not collect the run
+        return [chunk async for chunk in resolved]
+
+    try:
+        chunks = asyncio.run(scenario())
+    finally:
+        client.close()
+    assert chunks[0].choices[0].delta.content == "hello"
+    assert chunks[-1].usage.total_tokens == 6
 
 
 @pytest.mark.parametrize("mode", ["relay", "await", "async_for"])
@@ -587,8 +1074,7 @@ def test_lazy_stream_preserves_provider_error_and_client_cancellation():
         def stream(self):
             started.set()
             assert cancelled.wait(5), "Client cancellation did not reach the SDK run"
-            yield SimpleNamespace(type="status", message=SimpleNamespace(
-                status="CANCELLED", message="offline cancelled run"))
+            yield _status_event("CANCELLED", "offline cancelled run")
 
         def cancel(self):
             super().cancel()

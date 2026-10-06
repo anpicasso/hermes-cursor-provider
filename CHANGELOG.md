@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.6
+
+- Replaces synthesized, post-completion chunks with genuine incremental SDK text streaming for Hermes Relay and async consumers. Awaiting a stream no longer collects the whole run.
+- Parses tool-call blocks incrementally, including split delimiters and delimiter text inside JSON arguments; ordinary text is forwarded while Hermes retains tool execution and approvals.
+- Preserves usage, session reuse, and terminal error propagation without duplicating the SDK's final text. Closing a stream cancels its run and releases session state, including cancellation during startup.
+- Adds first-chunk-before-completion regressions and a real managed Relay gate test. Live Relay/async streaming and a Hermes tool round trip were verified.
+
 ## 0.3.5
 
 - Fixes premature fallback under Hermes' managed Relay: streaming requests return a lazy sync/async-compatible stream instead of an unawaited coroutine.

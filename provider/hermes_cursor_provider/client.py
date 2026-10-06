@@ -8,20 +8,18 @@ import hashlib
 import importlib
 import json
 import os
-import re
 import shutil
 import tempfile
 import threading
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
 CURSOR_API_URL = "https://api.cursor.com"
-_TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
 
@@ -243,49 +241,47 @@ def extract_images(messages: list[Any]) -> list[dict[str, str]]:
     return images
 
 
+def _tool_call_from_payload(payload_text: str, allowed_names: set[str], ordinal: int) -> Any | None:
+    """Parse one <tool_call> JSON body into a Hermes tool call, or None when unusable."""
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    function = payload.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = str(function.get("name") or "").strip()
+    if not name or name not in allowed_names:
+        return None
+    arguments = function.get("arguments", "{}")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    try:
+        decoded = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    call_id = str(payload.get("id") or f"cursor_call_{ordinal}").strip()
+    return SimpleNamespace(
+        id=call_id,
+        call_id=call_id,
+        type="function",
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
 def extract_tool_calls(text: str, allowed_names: set[str]) -> tuple[list[Any], str]:
     if not isinstance(text, str) or not text:
         return [], ""
-    calls: list[Any] = []
-    consumed: list[tuple[int, int]] = []
-    for match in _TOOL_BLOCK_RE.finditer(text):
-        try:
-            payload = json.loads(match.group(1))
-        except (TypeError, json.JSONDecodeError):
-            continue
-        function = payload.get("function") if isinstance(payload, dict) else None
-        name = str(function.get("name") or "").strip() if isinstance(function, dict) else ""
-        if not name or name not in allowed_names:
-            continue
-        assert isinstance(function, dict)
-        arguments = function.get("arguments", "{}")
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
-        try:
-            decoded = json.loads(arguments)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(decoded, dict):
-            continue
-        call_id = str(payload.get("id") or f"cursor_call_{len(calls) + 1}").strip()
-        calls.append(
-            SimpleNamespace(
-                id=call_id,
-                call_id=call_id,
-                type="function",
-                function=SimpleNamespace(name=name, arguments=arguments),
-            )
-        )
-        consumed.append(match.span())
-    if not consumed:
-        return calls, text.strip()
-    parts: list[str] = []
-    cursor = 0
-    for start, end in consumed:
-        parts.append(text[cursor:start])
-        cursor = end
-    parts.append(text[cursor:])
-    return calls, "".join(parts).strip()
+    parser = _ToolBlockStream(allowed_names)
+    for _ in parser.feed(text):
+        pass
+    for _ in parser.flush():
+        pass
+    return parser.calls, parser.text
 
 
 def _usage(result: Any) -> Any:
@@ -314,53 +310,128 @@ def _tool_delta(call: Any, index: int) -> Any:
     )
 
 
-class StreamChunks(list):
-    """Small sync/async stream used because Cursor SDK returns a completed run."""
-
-    def __aiter__(self):
-        async def generate():
-            for chunk in self:
-                yield chunk
-        return generate()
-
-    async def aclose(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
+def _unsent_tail(delivered: str, full: str) -> str:
+    """Suffix of the terminal text not already streamed, so completed text never repeats."""
+    if not full or not full.startswith(delivered):
+        return ""
+    return full[len(delivered):]
 
 
-def completion_to_chunks(completion: Any) -> StreamChunks:
-    choice = completion.choices[0]
-    message = choice.message
-    tool_calls = [
-        _tool_delta(call, index) for index, call in enumerate(message.tool_calls or [])
-    ] or None
-    delta = SimpleNamespace(
-        role="assistant",
-        content=message.content or None,
-        tool_calls=tool_calls,
-        reasoning=None,
-        reasoning_content=None,
-    )
-    return StreamChunks(
-        [
-            SimpleNamespace(
-                id=completion.id,
-                object="chat.completion.chunk",
-                model=completion.model,
-                choices=[SimpleNamespace(index=0, delta=delta, finish_reason=choice.finish_reason)],
-                usage=None,
-            ),
-            SimpleNamespace(
-                id=completion.id,
-                object="chat.completion.chunk",
-                model=completion.model,
-                choices=[],
-                usage=completion.usage,
-            ),
-        ]
-    )
+_EXHAUSTED = object()
+
+
+def _next_or_stop(iterator: Any) -> Any:
+    """Pull one chunk without leaking StopIteration across an await boundary."""
+    try:
+        return next(iterator)
+    except StopIteration:
+        return _EXHAUSTED
+
+
+
+def _drain(execution: Any) -> Any:
+    """Exhaust an execution generator and return its (result, calls, content)."""
+    while True:
+        try:
+            next(execution)
+        except StopIteration as stop:
+            return stop.value
+
+
+def _possible_open_suffix(value: str) -> int:
+    """Length of the longest suffix of ``value`` that could still become '<tool_call>'."""
+    opener = _ToolBlockStream._OPEN
+    for width in range(min(len(value), len(opener) - 1), 0, -1):
+        if value.endswith(opener[:width]):
+            return width
+    return 0
+
+
+class _ToolBlockStream:
+    """Incremental splitter for the prompt-injected <tool_call> protocol.
+
+    Emits ordinary text as soon as it is safe and buffers only a possibly-incomplete
+    tool block, so arbitrary stream splits never tear a validated call. Blocks that do
+    not validate are re-emitted verbatim, matching ``extract_tool_calls``."""
+
+    _OPEN = "<tool_call>"
+    _CLOSE = "</tool_call>"
+
+    def __init__(self, allowed_names: set[str]) -> None:
+        self._allowed = allowed_names
+        self._buffer = ""
+        self._text: list[str] = []
+        self.calls: list[Any] = []
+        self._scan = len(self._OPEN)
+        self._quoted = self._escaped = False
+
+    @property
+    def text(self) -> str:
+        return "".join(self._text).strip()
+
+    def feed(self, chunk: str) -> Iterable[tuple[str, Any]]:
+        self._buffer += chunk
+        while True:
+            start = self._buffer.find(self._OPEN)
+            if start < 0:
+                keep = _possible_open_suffix(self._buffer)
+                if keep < len(self._buffer):
+                    part, self._buffer = (
+                        self._buffer[: len(self._buffer) - keep],
+                        self._buffer[len(self._buffer) - keep:],
+                    )
+                    yield ("text", self._record(part))
+                return
+            if start > 0:
+                part, self._buffer = self._buffer[:start], self._buffer[start:]
+                yield ("text", self._record(part))
+            end = self._block_end()
+            if end < 0:
+                return  # only an incomplete tool block stays buffered
+            block, self._buffer = (
+                self._buffer[: end + len(self._CLOSE)],
+                self._buffer[end + len(self._CLOSE):],
+            )
+            self._scan = len(self._OPEN)
+            self._quoted = self._escaped = False
+            call = _tool_call_from_payload(
+                block[len(self._OPEN): -len(self._CLOSE)].strip(),
+                self._allowed,
+                len(self.calls) + 1,
+            )
+            if call is None:
+                yield ("text", self._record(block))
+            else:
+                self.calls.append(call)
+                yield ("call", call)
+
+    def _block_end(self) -> int:
+        # Delimiters inside JSON strings are tool arguments, not protocol boundaries.
+        while self._scan < len(self._buffer):
+            char = self._buffer[self._scan]
+            if not self._quoted and char == "<":
+                if self._buffer.startswith(self._CLOSE, self._scan):
+                    return self._scan
+                if self._CLOSE.startswith(self._buffer[self._scan:]):
+                    return -1
+            if self._escaped:
+                self._escaped = False
+            elif self._quoted and char == "\\":
+                self._escaped = True
+            elif char == '"':
+                self._quoted = not self._quoted
+            self._scan += 1
+        return -1
+
+    def flush(self) -> Iterable[tuple[str, Any]]:
+        if self._buffer:
+            tail, self._buffer = self._buffer, ""
+            yield ("text", self._record(tail))
+
+    def _record(self, part: str) -> str:
+        if part:
+            self._text.append(part)
+        return part
 
 
 def _model_id(model: str | None) -> str | None:
@@ -536,31 +607,81 @@ def _reset_session_registry() -> None:
 atexit.register(_reset_session_registry)
 
 
+class _StreamControl:
+    """Cross-thread handle so ``close()`` can cancel the run a worker is blocked on."""
+
+    run: Any = None
+    closed: bool = False
+
+
 class _LazyStream:
-    """One buffered SDK run, consumable by sync Relay and async callers."""
+    """One Cursor SDK run exposed as a lazy sync/async chunk stream.
+
+    Nothing starts until the first pull; a pull drives the (blocking) SDK work on
+    the calling thread, which for Hermes' Relay is its off-loop worker."""
 
     def __init__(self, client: "CursorSDKClient", kwargs: dict[str, Any]) -> None:
-        def generate():
-            yield from client._create_chat_completion(**kwargs)
+        self._client = client
+        self._kwargs = kwargs
+        self._closed = False
+        self._control = _StreamControl()
+        self._iterator: Any = None
 
-        self._iterator = generate()
+    def _start(self) -> Any:
+        if self._iterator is None:
+            self._iterator = self._client._create_chat_completion(
+                **self._kwargs, _cursor_stream_control=self._control
+            )
+            if self._closed:
+                self._iterator.close()
+        return self._iterator
 
     def __iter__(self):
         # ponytail: Relay calls iter() on-loop; its worker pulls next() off-loop.
-        return self._iterator
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._start())
+        finally:
+            if self._closed and self._iterator is not None:
+                self._iterator.close()
 
     def __await__(self):
-        return asyncio.to_thread(StreamChunks, self._iterator).__await__()
+        # Resolve to an async iterable immediately; the run starts on the first pull.
+        async def resolve() -> "_LazyStream":
+            return self
+
+        return resolve().__await__()
 
     async def __aiter__(self):
-        for chunk in await self:
-            yield chunk
+        try:
+            while True:
+                chunk = await asyncio.to_thread(_next_or_stop, self)
+                if chunk is _EXHAUSTED:
+                    return
+                yield chunk
+        finally:
+            await asyncio.to_thread(self.close)
 
     def close(self) -> None:
-        self._iterator.close()
+        self._closed = True
+        self._control.closed = True
+        if self._iterator is None:
+            return
+        try:
+            self._iterator.close()
+        except ValueError:
+            # A worker thread is inside next(); cancel its run so it unwinds there.
+            run = self._control.run
+            if run is not None:
+                with suppress(Exception):
+                    run.cancel()
 
     async def aclose(self) -> None:
-        self.close()
+        await asyncio.to_thread(self.close)
 
 
 class _Completions:
@@ -650,49 +771,72 @@ class CursorSDKClient:
             options["model"] = selected_model
         return client.create_agent(options)
 
-    def _run_agent(self, agent: Any, *, prompt: str, images: list[dict[str, str]]) -> Any:
+    def _run_agent(
+        self,
+        agent: Any,
+        *,
+        prompt: str,
+        images: list[dict[str, str]],
+        allowed_names: set[str],
+        control: _StreamControl | None = None,
+    ) -> Any:
+        """Run one agent turn, yielding ('text'|'call', value) events as they stream.
+
+        Returns (result, calls, content) — the extraction the buffered path used,
+        produced incrementally so callers see text before the SDK run completes."""
+        parser = _ToolBlockStream(allowed_names)
         run = None
         try:
             run = agent.send({"text": prompt, "images": images})
             with self._runs_lock:
                 self._runs.add(run)
-            streamed_parts: list[str] = []
+            if control is not None:
+                control.run = run
+                if control.closed or self.is_closed:
+                    raise CursorSDKRunError("Cursor stream cancelled during startup")
+            streamed = ""
             failure = ""
             stream = getattr(run, "stream", None)
             if callable(stream):
                 for event in cast(Iterable[Any], stream()):
                     kind = str(getattr(event, "type", ""))
-                    payload = getattr(event, "message", None)
                     if kind == "assistant":
+                        payload = getattr(event, "message", None)
                         for block in getattr(payload, "content", ()) or ():
                             text = str(getattr(block, "text", "") or "")
                             if text:
-                                streamed_parts.append(text)
+                                streamed += text
+                                yield from parser.feed(text)
                     elif kind == "status":
-                        status = str(getattr(payload, "status", "") or "").upper()
+                        status = str(getattr(event, "status", "") or "").upper()
                         if status in {"ERROR", "CANCELLED", "EXPIRED"}:
-                            failure = str(getattr(payload, "message", "") or status)
+                            failure = str(getattr(event, "message", "") or status)
             else:
                 iter_text = getattr(run, "iter_text", None)
                 if callable(iter_text):
-                    streamed_parts.extend(
-                        part for part in cast(Iterable[str], iter_text()) if part
-                    )
+                    for part in cast(Iterable[str], iter_text()):
+                        text = str(part or "")
+                        if text:
+                            streamed += text
+                            yield from parser.feed(text)
             result = run.wait()
             status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
             status = str(status_value or "").upper()
             if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
                 raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
-            streamed = "".join(streamed_parts)
-            if streamed and not getattr(result, "result", ""):
-                return replace(result, result=streamed)
-            return result
+            tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
+            if tail:
+                yield from parser.feed(tail)
+            yield from parser.flush()
+            return result, parser.calls, parser.text
         except BaseException:
             if run is not None:
                 with suppress(Exception):
                     run.cancel()
             raise
         finally:
+            if control is not None:
+                control.run = None
             if run is not None:
                 with self._runs_lock:
                     self._runs.discard(run)
@@ -705,6 +849,8 @@ class CursorSDKClient:
         images: list[dict[str, str]],
         model: str | None,
         timeout: float,
+        allowed_names: set[str],
+        control: _StreamControl | None = None,
     ) -> Any:
         sessions_root = Path(bridge.workspace.name) / "sessions"
         sessions_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -713,7 +859,15 @@ class CursorSDKClient:
                 bridge=bridge, cwd=Path(cwd), model=model, timeout=timeout
             )
             try:
-                return self._run_agent(agent, prompt=prompt, images=images)
+                return (
+                    yield from self._run_agent(
+                        agent,
+                        prompt=prompt,
+                        images=images,
+                        allowed_names=allowed_names,
+                        control=control,
+                    )
+                )
             finally:
                 with suppress(Exception):
                     agent.close()
@@ -727,7 +881,12 @@ class CursorSDKClient:
         tool_choice: Any,
         timeout: float,
         session_scope: str,
-    ) -> tuple[Any, list[Any], str]:
+        control: _StreamControl | None = None,
+    ) -> Any:
+        """Run one logical turn, yielding ('text'|'call', value) as the SDK streams.
+
+        Returns (result, calls, content). Non-stream callers drain it; stream callers
+        convert the events into OpenAI chunks before the SDK run completes."""
         self._validate_request()
         home = _home_key()
         bridge = _bridge_for(home)
@@ -737,17 +896,17 @@ class CursorSDKClient:
             prompt, allowed_names = render_prompt(
                 messages, tools=tools, tool_choice=tool_choice
             )
-            result = self._run_ephemeral(
-                bridge=bridge,
-                prompt=prompt,
-                images=extract_images(messages),
-                model=model,
-                timeout=timeout,
+            return (
+                yield from self._run_ephemeral(
+                    bridge=bridge,
+                    prompt=prompt,
+                    images=extract_images(messages),
+                    model=model,
+                    timeout=timeout,
+                    allowed_names=allowed_names,
+                    control=control,
+                )
             )
-            calls, content = extract_tool_calls(
-                str(getattr(result, "result", "") or ""), allowed_names
-            )
-            return result, calls, content
 
         account = hashlib.blake2b(self.api_key.encode(), digest_size=16).hexdigest()
         key = (home, session_scope, account, str(_model_id(model)))
@@ -757,17 +916,17 @@ class CursorSDKClient:
             prompt, allowed_names = render_prompt(
                 messages, tools=tools, tool_choice=tool_choice
             )
-            result = self._run_ephemeral(
-                bridge=bridge,
-                prompt=prompt,
-                images=extract_images(messages),
-                model=model,
-                timeout=timeout,
+            return (
+                yield from self._run_ephemeral(
+                    bridge=bridge,
+                    prompt=prompt,
+                    images=extract_images(messages),
+                    model=model,
+                    timeout=timeout,
+                    allowed_names=allowed_names,
+                    control=control,
+                )
             )
-            calls, content = extract_tool_calls(
-                str(getattr(result, "result", "") or ""), allowed_names
-            )
-            return result, calls, content
 
         try:
             extends = (
@@ -794,17 +953,16 @@ class CursorSDKClient:
             prompt, allowed_names = render_prompt(
                 request_messages, tools=tools, tool_choice=tool_choice
             )
-            result = self._run_agent(
+            result, calls, content = yield from self._run_agent(
                 session.agent,
                 prompt=prompt,
                 images=extract_images(request_messages),
-            )
-            calls, content = extract_tool_calls(
-                str(getattr(result, "result", "") or ""), allowed_names
+                allowed_names=allowed_names,
+                control=control,
             )
             session.history = incoming + [_assistant_history(content, calls)]
             return result, calls, content
-        except Exception:
+        except BaseException:
             if session.agent is not None:
                 with suppress(Exception):
                     session.agent.close()
@@ -824,16 +982,23 @@ class CursorSDKClient:
         stream: bool = False,
         timeout: Any = None,
         _cursor_session_scope: str | None = None,
+        _cursor_stream_control: Any = None,
         **_: Any,
     ) -> Any:
-        result, calls, content = self._execute(
-            model=model,
-            messages=messages or [],
-            tools=tools,
-            tool_choice=tool_choice,
-            timeout=_timeout_seconds(timeout),
-            session_scope=str(_cursor_session_scope or "").strip(),
-        )
+        if stream:
+            return self._stream_chat_completion(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout=timeout,
+                _cursor_session_scope=_cursor_session_scope,
+                _cursor_stream_control=_cursor_stream_control,
+            )
+        result, calls, content = _drain(self._execute(
+            model=model, messages=messages or [], tools=tools, tool_choice=tool_choice,
+            timeout=_timeout_seconds(timeout), session_scope=str(_cursor_session_scope or "").strip(),
+        ))
         completion = SimpleNamespace(
             id=f"chatcmpl-cursor-{uuid.uuid4().hex}",
             object="chat.completion",
@@ -854,7 +1019,94 @@ class CursorSDKClient:
             ],
             usage=_usage(result),
         )
-        return completion_to_chunks(completion) if stream else completion
+        return completion
+
+    def _stream_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[Any] | None = None,
+        tools: list[Any] | None = None,
+        tool_choice: Any = None,
+        timeout: Any = None,
+        _cursor_session_scope: str | None = None,
+        _cursor_stream_control: Any = None,
+        **_: Any,
+    ) -> Any:
+        """Yield OpenAI-shaped chunks while the underlying Cursor run is still in flight."""
+        execution = self._execute(
+            model=model,
+            messages=messages or [],
+            tools=tools,
+            tool_choice=tool_choice,
+            timeout=_timeout_seconds(timeout),
+            session_scope=str(_cursor_session_scope or "").strip(),
+            control=_cursor_stream_control,
+        )
+        stream_id = f"chatcmpl-cursor-{uuid.uuid4().hex}"
+        response_model = str(model or "cursor")
+        first = True
+        content_started = False
+        pending_ws = ""
+        calls: list[Any] = []
+
+        def chunk(*, content: str | None = None, tool_calls: Any = None, finish_reason: str | None = None) -> Any:
+            nonlocal first
+            delta = SimpleNamespace(
+                role="assistant" if first else None,
+                content=content,
+                tool_calls=tool_calls,
+                reasoning=None,
+                reasoning_content=None,
+            )
+            first = False
+            return SimpleNamespace(
+                id=stream_id,
+                object="chat.completion.chunk",
+                model=response_model,
+                choices=[SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)],
+                usage=None,
+            )
+
+        try:
+            while True:
+                try:
+                    kind, value = next(execution)
+                except StopIteration as stop:
+                    result, _, _ = stop.value
+                    break
+                if kind == "call":
+                    calls.append(value)
+                    yield chunk(tool_calls=[_tool_delta(value, len(calls) - 1)])
+                    continue
+                if not value:
+                    continue
+                stripped = value.rstrip()
+                if not stripped:
+                    pending_ws += value
+                    continue
+                if content_started:
+                    piece = pending_ws + stripped
+                else:
+                    piece = stripped.lstrip()
+                pending_ws = value[len(stripped):]
+                if piece:
+                    content_started = True
+                    yield chunk(content=piece)
+
+            response_model = str(
+                model or getattr(getattr(result, "model", None), "id", "") or "cursor"
+            )
+            yield chunk(finish_reason="tool_calls" if calls else "stop")
+            yield SimpleNamespace(
+                id=stream_id,
+                object="chat.completion.chunk",
+                model=response_model,
+                choices=[],
+                usage=_usage(result),
+            )
+        finally:
+            execution.close()
 
 
 def list_cursor_models(*, api_key: str, timeout: float = 8.0) -> list[str]:
