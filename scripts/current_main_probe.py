@@ -10,6 +10,57 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def verify_managed_stream(profile) -> None:
+    """Exercise the real Relay consumer, not only provider registration."""
+    from types import SimpleNamespace
+    from agent import relay_llm, relay_runtime
+    from agent.chat_completion_helpers_relay import RelayChatAccumulator
+
+    client = profile.create_client(api_key="offline-probe-token")
+    calls = []
+
+    def execute(**kwargs):
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("SDK work must run off the Relay event loop")
+        calls.append(kwargs)
+        return SimpleNamespace(usage=None), [], "relay-ok"
+
+    client._execute = execute
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    lease = coordinator.acquire_conversation(
+        profile_key=relay_runtime.current_profile_key(), session_id="relay-probe", platform="cli")
+    turn = coordinator.begin_turn(lease, turn_id="turn-1", task_id="probe")
+    lease.host.retain_managed_execution("cursor-probe")
+    accumulator = RelayChatAccumulator()
+    stream = None
+    try:
+        stream = relay_llm.stream(
+            {"model": "auto", "messages": [{"role": "user", "content": "hello"}], "stream": True},
+            lambda request: client.chat.completions.create(**request),
+            session_id="relay-probe", name="cursor", model_name="auto",
+            finalizer=accumulator.finalize, on_chunk=accumulator.observe,
+            completed_response_predicate=lambda value: hasattr(value, "choices"),
+            metadata={"api_mode": "chat_completions"},
+        )
+        chunks = list(stream)
+        assert chunks[0].choices[0].delta.content == "relay-ok"
+        assert chunks[-1].usage.total_tokens == 0
+        assert len(calls) == 1
+    finally:
+        if stream is not None:
+            stream.close()
+        client.close()
+        lease.host.release_managed_execution("cursor-probe")
+        coordinator.end_turn(turn, outcome="success")
+        coordinator.release_conversation(lease)
+        relay_runtime._reset_for_tests()
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hermes-cursor-probe-") as raw_home:
         home = Path(raw_home)
@@ -88,9 +139,11 @@ def main() -> None:
         assert aux_model == "auto"
         assert aux_client.HERMES_SKIP_ASYNC_WRAP
         aux_client.close()
+        verify_managed_stream(profile)
 
         print(json.dumps({
             "ok": True,
+            "managed_relay_stream": True,
             "hermes_source": str(Path(providers.__file__).resolve()),
             "provider": runtime["provider"],
             "api_mode": runtime["api_mode"],

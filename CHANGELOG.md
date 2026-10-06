@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5
+
+- Fixes premature fallback under Hermes' managed Relay: streaming requests return a lazy sync/async-compatible stream instead of an unawaited coroutine.
+- Keeps SDK work off the Relay event loop, executes each stream only once, and preserves async auxiliary calls, provider errors, and client cancellation.
+- Adds regressions for Relay-style iteration, asynchronous streams, closing unconsumed streams, and cancellation; the current-main probe now exercises a real managed Relay stream.
+
 ## 0.3.4
 
 - Reports Cursor SDK cache-write tokens to Hermes and maps Cursor's meter-sum `total_tokens` to the OpenAI-compatible prompt-plus-completion total.

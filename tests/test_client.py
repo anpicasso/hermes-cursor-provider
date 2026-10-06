@@ -531,3 +531,87 @@ def test_failed_wait_cancels_in_flight_run():
         client._run_agent(agent, prompt="hello", images=[])
     assert failed.cancelled
     assert failed not in client._runs
+
+
+@pytest.mark.parametrize("mode", ["relay", "await", "async_for"])
+def test_lazy_stream_works_inside_event_loop_without_blocking(monkeypatch, mode):
+    client = CursorSDKClient(api_key="crsr_test")
+    original_wait = FakeRun.wait
+
+    def checked_wait(run):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return original_wait(run)
+
+    monkeypatch.setattr(FakeRun, "wait", checked_wait)
+
+    async def scenario():
+        stream = client.chat.completions.create(model="auto", messages=[], stream=True)
+        assert FakeCursorClient.launches == []
+        if mode == "relay":
+            iterator = iter(stream)  # Relay constructs/iterates on-loop, pulls off-loop.
+            assert FakeCursorClient.launches == []
+            chunks = await asyncio.to_thread(list, iterator)
+            assert list(stream) == []  # A consumed stream must not start a second run.
+        elif mode == "await":
+            chunks = [chunk async for chunk in await stream]
+        else:
+            chunks = [chunk async for chunk in stream]
+        stream.close()
+        return chunks
+
+    try:
+        chunks = asyncio.run(scenario())
+    finally:
+        client.close()
+    assert chunks[0].choices[0].delta.content == "hello"
+    assert chunks[-1].usage.total_tokens == 6
+    assert len(FakeCursorClient.instances[0].messages) == 1
+
+
+def test_close_unconsumed_stream_never_launches_sdk():
+    client = CursorSDKClient(api_key="crsr_test")
+    stream = client.chat.completions.create(model="auto", messages=[], stream=True)
+    stream.close()
+    assert list(stream) == []
+    client.close()
+    assert FakeCursorClient.launches == []
+
+
+def test_lazy_stream_preserves_provider_error_and_client_cancellation():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    started, cancelled = threading.Event(), threading.Event()
+
+    class CancellableRun(FakeRun):
+        def stream(self):
+            started.set()
+            assert cancelled.wait(5), "Client cancellation did not reach the SDK run"
+            yield SimpleNamespace(type="status", message=SimpleNamespace(
+                status="CANCELLED", message="offline cancelled run"))
+
+        def cancel(self):
+            super().cancel()
+            cancelled.set()
+
+    run = CancellableRun(sdk.result)
+    agent = FakeAgent(sdk)
+    agent.send = lambda message: run
+    sdk.create_agent = lambda options: agent
+
+    async def scenario():
+        stream = client.chat.completions.create(model="auto", messages=[], stream=True)
+        task = asyncio.create_task(asyncio.to_thread(list, iter(stream)))
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            client.close()
+            with pytest.raises(client_module.CursorSDKRunError, match="offline cancelled run"):
+                await task
+        finally:
+            cancelled.set()
+            await asyncio.gather(task, return_exceptions=True)
+            stream.close()
+
+    asyncio.run(scenario())
+    assert run.cancelled and not client._runs
+    assert agent.closed

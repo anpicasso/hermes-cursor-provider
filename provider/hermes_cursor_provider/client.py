@@ -536,11 +536,40 @@ def _reset_session_registry() -> None:
 atexit.register(_reset_session_registry)
 
 
+class _LazyStream:
+    """One buffered SDK run, consumable by sync Relay and async callers."""
+
+    def __init__(self, client: "CursorSDKClient", kwargs: dict[str, Any]) -> None:
+        def generate():
+            yield from client._create_chat_completion(**kwargs)
+
+        self._iterator = generate()
+
+    def __iter__(self):
+        # ponytail: Relay calls iter() on-loop; its worker pulls next() off-loop.
+        return self._iterator
+
+    def __await__(self):
+        return asyncio.to_thread(StreamChunks, self._iterator).__await__()
+
+    async def __aiter__(self):
+        for chunk in await self:
+            yield chunk
+
+    def close(self) -> None:
+        self._iterator.close()
+
+    async def aclose(self) -> None:
+        self.close()
+
+
 class _Completions:
     def __init__(self, client: "CursorSDKClient") -> None:
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
+        if kwargs.get("stream"):
+            return _LazyStream(self._client, kwargs)
         try:
             asyncio.get_running_loop()
         except RuntimeError:
