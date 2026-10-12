@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import asyncio
 import base64
 from dataclasses import dataclass
@@ -1128,3 +1129,29 @@ def test_block_with_only_unknown_or_placeholder_is_still_rejected():
         '<tool_call>{"id":"c","function":{"name":"nope","arguments":"{}"}}</tool_call>', {"kanban_show"}
     )
     assert calls == []
+
+
+def test_identical_calls_in_one_reply_are_deduplicated():
+    allowed = {"kanban_request_review", "read_file"}
+    call = '{"id":"call_1","type":"function","function":{"name":"kanban_request_review","arguments":{"task_id":"t_1"}}}'
+    text = "".join(f"<tool_call>{call}</tool_call>" for _ in range(20))
+    calls, _ = client_module.extract_tool_calls(text, allowed)
+    assert len(calls) == 1
+    assert calls[0].function.name == "kanban_request_review"
+
+
+def test_same_tool_with_different_args_is_kept_and_ids_made_unique():
+    allowed = {"read_file"}
+    a = '{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"a.py"}}}'
+    b = '{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"b.py"}}}'
+    calls, _ = client_module.extract_tool_calls(f"<tool_call>{a}</tool_call><tool_call>{b}</tool_call>", allowed)
+    assert [json.loads(c.function.arguments)["path"] for c in calls] == ["a.py", "b.py"]
+    assert len({c.id for c in calls}) == 2
+
+
+def test_argument_key_order_does_not_defeat_dedup():
+    allowed = {"read_file"}
+    a = '{"type":"function","function":{"name":"read_file","arguments":{"path":"a.py","limit":5}}}'
+    b = '{"type":"function","function":{"name":"read_file","arguments":{"limit":5,"path":"a.py"}}}'
+    calls, _ = client_module.extract_tool_calls(f"<tool_call>{a}</tool_call><tool_call>{b}</tool_call>", allowed)
+    assert len(calls) == 1

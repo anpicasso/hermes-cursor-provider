@@ -491,6 +491,9 @@ class _ToolBlockStream:
         self._text: list[str] = []
         self.calls: list[Any] = []
         self.rejected = 0
+        self.duplicates = 0
+        self._seen_calls: set[tuple[str, str]] = set()
+        self._seen_ids: set[str] = set()
         self._scan = len(self._OPEN)
         self._quoted = self._escaped = False
 
@@ -535,8 +538,33 @@ class _ToolBlockStream:
                 yield ("text", self._record(block))
             else:
                 for call in found:
+                    if not self._accept(call):
+                        continue
                     self.calls.append(call)
                     yield ("call", call)
+
+    def _accept(self, call: Any) -> bool:
+        # A model sometimes repeats the exact same call many times in one reply; executing every
+        # copy repeats side effects (e.g. 20x kanban_request_review), so keep only the first.
+        try:
+            canonical = json.dumps(json.loads(call.function.arguments), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            canonical = str(call.function.arguments)
+        key = (call.function.name, canonical)
+        if key in self._seen_calls:
+            self.duplicates += 1
+            _LOG.warning("cursor provider: dropped a duplicate %s call in the same reply", call.function.name)
+            _debug_event("duplicate_tool_call", name=call.function.name)
+            return False
+        self._seen_calls.add(key)
+        # Call ids must be unique within a reply so each result pairs with the right call.
+        if call.id in self._seen_ids:
+            base, n = call.id, 2
+            while f"{base}_{n}" in self._seen_ids:
+                n += 1
+            call.id = call.call_id = f"{base}_{n}"
+        self._seen_ids.add(call.id)
+        return True
 
     def _block_end(self) -> int:
         # Delimiters inside JSON strings are tool arguments, not protocol boundaries.
