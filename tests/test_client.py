@@ -693,7 +693,8 @@ def test_stream_splits_tool_block_at_arbitrary_boundaries():
         '<tool_call>{"function":{"name":"read_file","arguments":"not-json"}}</tool_call>',
     ],
 )
-def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block):
+def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block, monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_RETRY", "0")  # parser pass-through behaviour, not the retry
     text = f"before {block} after"
     expected_calls, expected_content = extract_tool_calls(text, {"read_file"})
     assert expected_calls == [] and "tool_call" in expected_content

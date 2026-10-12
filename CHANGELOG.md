@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased (fork: native tool-call interception)
+
+- Handles the SDK's native `tool_call` events. When the model calls an offered Hermes tool through Cursor's native channel (which the runtime answers with "Tool not found"), the call is converted into a Hermes tool call and the run is cancelled. Disable with `HERMES_CURSOR_INTERCEPT_NATIVE=0`.
+- Matches model-written tool names against offered tools (prefixes like `functions.`/`mcp_`, CamelCase, unique multi-word suffix) and unwraps Cursor's `CallMcpTool` wrapper.
+- Accepts `<tool_call>` JSON without the `function` wrapper (`name` + `arguments`/`parameters`/`args`/`input`).
+- Stronger prompt rules: Hermes tools are not native, "Tool not found" means wrong channel, never claim tools are unavailable; the rule is repeated right before the final transcript entry.
+- One corrective retry when a turn has no valid call but shows an unknown native tool or a rejected `<tool_call>` block. Disable with `HERMES_CURSOR_RETRY=0`.
+- Resets a retained SDK agent after a failed tool-call turn so later turns do not inherit "Tool not found" history. Disable with `HERMES_CURSOR_RESET_POISONED=0`.
+- Native calls are only converted on a final (completed or error) event, using that event's arguments (pending args from earlier running events are the fallback); calls still unfinished when the run ends are converted then.
+- Diagnostics: warnings through the `hermes_cursor_provider` logger; raw SDK events (truncated; values under key, token, secret, password, auth, cookie, text, value, input and fields are masked) to `<HERMES_HOME>/logs/cursor-provider-events.jsonl` when `HERMES_CURSOR_DEBUG_EVENTS=1`. Adds `scripts/native_tool_probe.py`.
+
 ## 0.3.6
 
 - Replaces synthesized, post-completion chunks with genuine incremental SDK text streaming for Hermes Relay and async consumers. Awaiting a stream no longer collects the whole run.
