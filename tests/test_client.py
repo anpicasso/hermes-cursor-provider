@@ -1102,3 +1102,29 @@ def test_lazy_stream_preserves_provider_error_and_client_cancellation():
     asyncio.run(scenario())
     assert run.cancelled and not client._runs
     assert agent.closed
+
+
+def test_multiple_calls_in_one_block_are_all_parsed():
+    from hermes_cursor_provider.client import extract_tool_calls
+
+    text = (
+        "<tool_call>\n"
+        '{"id":"call_1","type":"function","function":{"name":"kanban_show","arguments":"{\\"task_id\\":\\"t_1\\"}"}}\n'
+        '{"id":"call_2","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"x\\",\\"limit\\":3}"}}\n'
+        "</tool_call>"
+    )
+    calls, rest = extract_tool_calls(text, {"kanban_show", "web_search"})
+    assert [c.function.name for c in calls] == ["kanban_show", "web_search"]
+    assert [c.id for c in calls] == ["call_1", "call_2"]
+    assert rest == ""
+
+
+def test_block_with_only_unknown_or_placeholder_is_still_rejected():
+    from hermes_cursor_provider.client import extract_tool_calls
+
+    calls, _ = extract_tool_calls("<tool_call>{...}</tool_call>", {"kanban_show"})
+    assert calls == []
+    calls, _ = extract_tool_calls(
+        '<tool_call>{"id":"c","function":{"name":"nope","arguments":"{}"}}</tool_call>', {"kanban_show"}
+    )
+    assert calls == []

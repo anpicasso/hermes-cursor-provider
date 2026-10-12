@@ -370,6 +370,37 @@ def _tool_call_from_payload(payload_text: str, allowed_names: set[str], ordinal:
     )
 
 
+def _tool_calls_from_block(body: str, allowed_names: set[str], first_ordinal: int) -> list[Any]:
+    """Parse a <tool_call> body that holds one call, several concatenated JSON calls, or a JSON array.
+
+    Models often emit parallel calls as consecutive JSON objects inside a single block; the whole
+    body is not valid JSON then, so each object is decoded in turn and kept when it is a usable call."""
+    single = _tool_call_from_payload(body, allowed_names, first_ordinal)
+    if single is not None:
+        return [single]
+    decoder = json.JSONDecoder()
+    calls: list[Any] = []
+    index, length = 0, len(body)
+    while index < length:
+        while index < length and (body[index].isspace() or body[index] == ","):
+            index += 1
+        if index >= length:
+            break
+        try:
+            value, index = decoder.raw_decode(body, index)
+        except json.JSONDecodeError:
+            break
+        for item in value if isinstance(value, list) else [value]:
+            if not isinstance(item, dict):
+                continue
+            call = _tool_call_from_payload(
+                json.dumps(item, ensure_ascii=False), allowed_names, first_ordinal + len(calls)
+            )
+            if call is not None:
+                calls.append(call)
+    return calls
+
+
 def extract_tool_calls(text: str, allowed_names: set[str]) -> tuple[list[Any], str]:
     if not isinstance(text, str) or not text:
         return [], ""
@@ -492,19 +523,20 @@ class _ToolBlockStream:
             )
             self._scan = len(self._OPEN)
             self._quoted = self._escaped = False
-            call = _tool_call_from_payload(
+            found = _tool_calls_from_block(
                 block[len(self._OPEN): -len(self._CLOSE)].strip(),
                 self._allowed,
                 len(self.calls) + 1,
             )
-            if call is None:
+            if not found:
                 self.rejected += 1
                 _LOG.warning("cursor provider: rejected an unusable <tool_call> block (%d chars)", len(block))
                 _debug_event("rejected_tool_block", block=block)
                 yield ("text", self._record(block))
             else:
-                self.calls.append(call)
-                yield ("call", call)
+                for call in found:
+                    self.calls.append(call)
+                    yield ("call", call)
 
     def _block_end(self) -> int:
         # Delimiters inside JSON strings are tool arguments, not protocol boundaries.
