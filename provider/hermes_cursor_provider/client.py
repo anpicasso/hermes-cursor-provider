@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -192,6 +193,33 @@ def render_prompt(
     )
     sections.append("Continue from the final transcript entry.")
     return "\n\n".join(sections), allowed
+
+
+_ACTION_STARTS = tuple(
+    f"{intro} {verb} "
+    for intro in ("i'll", "i will", "let me", "i'm going to")
+    for verb in ("load", "read", "check", "inspect", "search", "look up", "run", "open", "fetch", "review", "verify")
+)
+
+
+def _action_only(text: str, *, partial: bool = False) -> bool:
+    """Conservatively recognize one short, unconditional tool-action announcement.
+
+    The partial form also holds split opening words, never a whole ordinary stream.
+    """
+    value = text.strip().lower().replace("’", "'")
+    if len(value) > 320 or len(value.split()) > 60:
+        return False
+    # A terminal word boundary can disappear when the next chunk extends an
+    # identifier (e.g. should_retry). Release only on an observed delimiter.
+    boundary = r"(?=\W)" if partial else r"\b"
+    if re.search(
+        r"[?\n]|[.!]\s+\S|\b(if|unless|could|would|want|once|when|after|before|should|upon)"
+        + boundary + r"|\brun through" + boundary, value
+    ):
+        return False
+    return any(value.startswith(start) or (partial and start.startswith(value))
+               for start in _ACTION_STARTS)
 
 
 def _image_payload(url: str) -> dict[str, str] | None:
@@ -778,6 +806,63 @@ class CursorSDKClient:
         prompt: str,
         images: list[dict[str, str]],
         allowed_names: set[str],
+        require_call: bool = False,
+        control: _StreamControl | None = None,
+    ) -> Any:
+        """Keep a short action-only preamble private until its turn is usable."""
+        require_call = bool(allowed_names) and require_call
+        for attempt in range(3):
+            execution = self._run_agent_once(
+                agent, prompt=prompt, images=images, allowed_names=allowed_names, control=control
+            )
+            held: list[tuple[str, Any]] = []
+            holding = bool(allowed_names)
+            try:
+                while True:
+                    try:
+                        event = next(execution)
+                    except StopIteration as stop:
+                        result, calls, content = stop.value
+                        break
+                    if holding:
+                        held.append(event)
+                        if event[0] == "call" or (not require_call and not _action_only("".join(
+                            value for kind, value in held if kind == "text"
+                        ), partial=True)):
+                            holding = False
+                            yield from held
+                            held.clear()
+                    else:
+                        yield event
+            finally:
+                execution.close()
+            if calls or not (require_call or (allowed_names and _action_only(content))):
+                yield from held
+                return result, calls, content
+            if attempt == 2:
+                raise CursorSDKRunError(
+                    "Cursor returned no valid Hermes tool call for a required or announced action; "
+                    "recovery exhausted. No tool action was executed by the adapter."
+                )
+            # Once recovery starts, only a validated call can satisfy the promised action.
+            require_call = True
+            prompt = (
+                "Your previous response contained no valid Hermes tool call. "
+                "No tool was executed. Request the needed tool using only "
+                '<tool_call>{"function":{"name":"NAME","arguments":{}}}</tool_call> '
+                "with the correct JSON arguments and an offered tool name: "
+                + ", ".join(sorted(allowed_names))
+                + ". Do not repeat an action announcement or claim completion. Hermes alone executes tools."
+            )
+            images = []
+
+    def _run_agent_once(
+        self,
+        agent: Any,
+        *,
+        prompt: str,
+        images: list[dict[str, str]],
+        allowed_names: set[str],
         control: _StreamControl | None = None,
     ) -> Any:
         """Run one agent turn, yielding ('text'|'call', value) events as they stream.
@@ -850,6 +935,7 @@ class CursorSDKClient:
         model: str | None,
         timeout: float,
         allowed_names: set[str],
+        require_call: bool = False,
         control: _StreamControl | None = None,
     ) -> Any:
         sessions_root = Path(bridge.workspace.name) / "sessions"
@@ -865,6 +951,7 @@ class CursorSDKClient:
                         prompt=prompt,
                         images=images,
                         allowed_names=allowed_names,
+                        require_call=require_call,
                         control=control,
                     )
                 )
@@ -891,6 +978,11 @@ class CursorSDKClient:
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)
+        choice = _plain(tool_choice)
+        require_call = choice == "required" or (
+            isinstance(choice, dict) and isinstance(choice.get("function"), dict)
+            and bool(choice["function"].get("name"))
+        )
 
         if not session_scope:
             prompt, allowed_names = render_prompt(
@@ -904,6 +996,7 @@ class CursorSDKClient:
                     model=model,
                     timeout=timeout,
                     allowed_names=allowed_names,
+                    require_call=require_call,
                     control=control,
                 )
             )
@@ -924,6 +1017,7 @@ class CursorSDKClient:
                     model=model,
                     timeout=timeout,
                     allowed_names=allowed_names,
+                    require_call=require_call,
                     control=control,
                 )
             )
@@ -958,6 +1052,7 @@ class CursorSDKClient:
                 prompt=prompt,
                 images=extract_images(request_messages),
                 allowed_names=allowed_names,
+                require_call=require_call,
                 control=control,
             )
             session.history = incoming + [_assistant_history(content, calls)]
