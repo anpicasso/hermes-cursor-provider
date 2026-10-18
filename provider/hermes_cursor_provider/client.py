@@ -434,15 +434,53 @@ class _ToolBlockStream:
         return part
 
 
-def _model_id(model: str | None) -> str | None:
+def _split_model(model: str | None) -> tuple[str, list[dict[str, str]]]:
+    """Split ``id@key=value,...`` into a Cursor model id and parameter list.
+
+    Parameter ids/values are the ones Cursor's ``list_models()`` reports
+    (e.g. ``reasoning_effort=xhigh,fast=true,context=500k``). Malformed
+    suffixes fail instead of silently selecting the default variant."""
     value = str(model or "").strip()
     for prefix in ("cursor/", "cursor:"):
         if value.lower().startswith(prefix):
             value = value[len(prefix):]
             break
+    base, sep, suffix = value.partition("@")
+    base = base.strip()
+    params: list[dict[str, str]] = []
+    if sep:
+        if not base:
+            raise ValueError(f"Cursor model parameters need a model id: {value!r}")
+        seen: set[str] = set()
+        for item in suffix.split(","):
+            key, eq, val = (part.strip() for part in item.partition("="))
+            if not eq or not key or not val:
+                raise ValueError(
+                    f"Cursor model parameters must be key=value pairs: {value!r}"
+                )
+            if key in seen:
+                raise ValueError(f"Cursor model parameters repeat {key!r}: {value!r}")
+            seen.add(key)
+            params.append({"id": key, "value": val})
     # Cursor requires an explicit model for local agents. ``auto`` is the
     # documented server-selected fallback; ``default`` is only our alias.
-    return "auto" if value.lower() in {"", "auto", "default"} else value
+    if base.lower() in {"", "auto", "default"}:
+        base = "auto"
+    return base, params
+
+
+def _model_id(model: str | None) -> str | None:
+    """Normalised model name, including any parameters (used as a session key)."""
+    base, params = _split_model(model)
+    if not params:
+        return base
+    return base + "@" + ",".join(f"{p['id']}={p['value']}" for p in params)
+
+
+def _model_selection(model: str | None) -> str | dict[str, Any]:
+    """Value for the SDK's ``model`` option: a bare id or ``{id, params}``."""
+    base, params = _split_model(model)
+    return {"id": base, "params": params} if params else base
 
 
 def _assistant_history(content: str, calls: list[Any]) -> dict[str, Any]:
@@ -766,7 +804,7 @@ class CursorSDKClient:
             "mcp_servers": {},
             "tools": [],
         }
-        selected_model = _model_id(model)
+        selected_model = _model_selection(model)
         if selected_model:
             options["model"] = selected_model
         return client.create_agent(options)
@@ -888,6 +926,7 @@ class CursorSDKClient:
         Returns (result, calls, content). Non-stream callers drain it; stream callers
         convert the events into OpenAI chunks before the SDK run completes."""
         self._validate_request()
+        _split_model(model)  # reject malformed model parameters before launching the bridge
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)

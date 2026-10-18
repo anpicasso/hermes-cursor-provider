@@ -38,6 +38,17 @@ Test without changing the configured default model:
 hermes chat --provider cursor --model auto -q 'Reply with exactly: OK'
 ```
 
+### Model parameters (effort, fast, context)
+
+Cursor models expose parameters such as reasoning effort, fast mode and context size (see each model's `parameters` in the SDK's `list_models()`). Append them to the model name as `@key=value,...`:
+
+```bash
+hermes chat --provider cursor --model 'grok-4.7@reasoning_effort=xhigh,fast=true' -q 'Reply with exactly: OK'
+hermes chat --provider cursor --model 'claude-opus-5-5@context=1m,effort=max' -q 'Reply with exactly: OK'
+```
+
+Without a suffix, Cursor picks the model's default variant. Malformed suffixes fail before a run starts, and Cursor rejects unknown values (`Invalid parameters for registry model`) instead of silently falling back. Each parameter combination gets its own retained agent.
+
 A running gateway may retain the previous provider import. After install or upgrade, restart it from an external shell:
 
 ```bash

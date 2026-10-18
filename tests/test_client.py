@@ -1101,3 +1101,91 @@ def test_lazy_stream_preserves_provider_error_and_client_cancellation():
     asyncio.run(scenario())
     assert run.cancelled and not client._runs
     assert agent.closed
+
+
+# --- model parameter selection (model@key=value,...) ---
+
+from hermes_cursor_provider.client import _model_id, _model_selection
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        (None, "auto"),
+        ("", "auto"),
+        ("default", "auto"),
+        ("grok-4.7", "grok-4.7"),
+        ("cursor/grok-4.7", "grok-4.7"),
+        (
+            "grok-4.7@reasoning_effort=xhigh,fast=true",
+            {"id": "grok-4.7", "params": [
+                {"id": "reasoning_effort", "value": "xhigh"},
+                {"id": "fast", "value": "true"},
+            ]},
+        ),
+        (
+            "cursor:claude-opus-5-5@ context=1m , effort=max ",
+            {"id": "claude-opus-5-5", "params": [
+                {"id": "context", "value": "1m"},
+                {"id": "effort", "value": "max"},
+            ]},
+        ),
+    ],
+)
+def test_model_selection_parses_params(name, expected):
+    assert _model_selection(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["grok-4.7@", "grok-4.7@xhigh", "grok-4.7@=x", "grok-4.7@fast=", "@fast=true",
+     "grok-4.7@fast=true,fast=false"],
+)
+def test_model_selection_rejects_malformed_params(name):
+    with pytest.raises(ValueError, match="Cursor model parameters"):
+        _model_selection(name)
+
+
+def test_create_agent_sends_parameterised_selection():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="grok-4.7@reasoning_effort=xhigh,fast=true",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.options[0]["model"] == {"id": "grok-4.7", "params": [
+        {"id": "reasoning_effort", "value": "xhigh"},
+        {"id": "fast", "value": "true"},
+    ]}
+
+
+def test_malformed_params_fail_before_bridge_launch():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        with pytest.raises(ValueError, match="Cursor model parameters"):
+            client.chat.completions.create(
+                model="grok-4.7@xhigh", messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        client.close()
+    assert FakeCursorClient.launches == []
+
+
+def test_sessions_isolate_parameter_variants():
+    for model in ("grok-4.7", "grok-4.7@reasoning_effort=xhigh", "grok-4.7@reasoning_effort=low"):
+        client = CursorSDKClient(api_key="crsr_a")
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": model}],
+            _cursor_session_scope="scope-1",
+        )
+        client.close()
+    assert len(FakeCursorClient.instances[0].agents) == 3
+    assert len(client_module._SESSIONS) == 3
+
+
+def test_model_id_keeps_params_in_normalised_name():
+    assert _model_id("cursor/grok-4.7@ fast=true ") == "grok-4.7@fast=true"
