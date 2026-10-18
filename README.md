@@ -49,6 +49,14 @@ hermes chat --provider cursor --model 'claude-opus-5-5@context=1m,effort=max' -q
 
 Without a suffix, Cursor picks the model's default variant. Malformed suffixes fail before a run starts, and Cursor rejects unknown values (`Invalid parameters for registry model`) instead of silently falling back. Each parameter combination gets its own retained agent.
 
+Hermes' `/model` command only accepts names from the provider's model listing. To make chosen variants selectable there, list them in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) in the profile's `.env`:
+
+```bash
+HERMES_CURSOR_MODEL_VARIANTS=grok-4.7@context=500k,reasoning_effort=xhigh,fast=true
+```
+
+Listed variants are appended to the model listing in normalised form; malformed entries, bare ids and variants of models your account cannot see are skipped.
+
 A running gateway may retain the previous provider import. After install or upgrade, restart it from an external shell:
 
 ```bash

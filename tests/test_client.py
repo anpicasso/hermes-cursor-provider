@@ -1189,3 +1189,37 @@ def test_sessions_isolate_parameter_variants():
 
 def test_model_id_keeps_params_in_normalised_name():
     assert _model_id("cursor/grok-4.7@ fast=true ") == "grok-4.7@fast=true"
+
+
+# --- opt-in parameter variants in the model listing (HERMES_CURSOR_MODEL_VARIANTS) ---
+
+
+def test_listing_without_variants_env_is_unchanged(monkeypatch):
+    monkeypatch.delenv("HERMES_CURSOR_MODEL_VARIANTS", raising=False)
+    assert list_cursor_models(api_key="crsr_test") == ["composer-2.5", "gpt-5.4"]
+
+
+def test_listing_appends_configured_variants_in_normalised_form(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_CURSOR_MODEL_VARIANTS",
+        " composer-2.5@fast=false ; cursor/gpt-5.4@ reasoning_effort=high , fast=true ;",
+    )
+    assert list_cursor_models(api_key="crsr_test") == [
+        "composer-2.5",
+        "gpt-5.4",
+        "composer-2.5@fast=false",
+        "gpt-5.4@reasoning_effort=high,fast=true",
+    ]
+
+
+def test_listing_skips_malformed_unknown_bare_and_duplicate_variants(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_CURSOR_MODEL_VARIANTS",
+        "composer-2.5@xhigh;not-a-model@fast=true;composer-2.5;"
+        "composer-2.5@fast=true;composer-2.5@fast=true",
+    )
+    assert list_cursor_models(api_key="crsr_test") == [
+        "composer-2.5",
+        "gpt-5.4",
+        "composer-2.5@fast=true",
+    ]

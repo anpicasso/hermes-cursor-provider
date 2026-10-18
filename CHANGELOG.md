@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Adds Cursor model parameter selection: `model@key=value,...` (e.g. `grok-4.7@reasoning_effort=xhigh,fast=true`) is sent to the SDK as `{id, params}`. Malformed suffixes fail before the bridge launches; parameter variants get separate retained sessions. Verified live: an xhigh+fast selection runs, and an invalid value is rejected by Cursor.
+- Adds opt-in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) so chosen parameter variants appear in the model listing and pass Hermes' `/model` validation.
 
 ## 0.3.6
 

@@ -1165,6 +1165,31 @@ def list_cursor_models(*, api_key: str, timeout: float = 8.0) -> list[str]:
             allow_api_key_env_fallback=False,
         )
         try:
-            return [str(model.id).strip() for model in client.list_models(api_key=api_key) if str(model.id).strip()]
+            models = [str(model.id).strip() for model in client.list_models(api_key=api_key) if str(model.id).strip()]
         finally:
             client.close()
+    return models + _configured_variants(models)
+
+
+def _configured_variants(models: list[str]) -> list[str]:
+    """Opt-in parameter variants to list alongside the base models.
+
+    ``HERMES_CURSOR_MODEL_VARIANTS`` is a ``;``-separated list such as
+    ``grok-4.7@context=500k,reasoning_effort=xhigh,fast=true``. Listing them lets
+    Hermes' model validation (e.g. ``/model``) accept the parameterised name.
+    Malformed entries, bare ids and variants of models the account cannot see
+    are skipped; Cursor still validates parameter values at run time."""
+    raw = os.environ.get("HERMES_CURSOR_MODEL_VARIANTS", "")
+    known = set(models)
+    out: list[str] = []
+    for entry in raw.split(";"):
+        if not entry.strip():
+            continue
+        try:
+            base, params = _split_model(entry)
+        except ValueError:
+            continue
+        name = _model_id(entry)
+        if params and base in known and name and name not in out:
+            out.append(name)
+    return out
