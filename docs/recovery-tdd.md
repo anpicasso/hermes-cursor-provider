@@ -14,8 +14,12 @@ remain unaffected. Native Cursor tools and MCP remain disabled.
 
 The detector deliberately favors false negatives. It recognizes one sentence
 with a fixed first-person action-verb prefix, at most 320 characters / 60 words,
-and rejects questions and conditional wording. It is not a general guarantee
-that every incomplete model answer can be detected.
+and rejects questions, conditional wording, and clause continuations after a
+colon, semicolon, or spaced dash. It is not a general guarantee that every
+incomplete model answer can be detected. Malformed or unoffered tool blocks are
+classified separately from prose: a turn that only announces an action and then
+emits an unusable block is retried or fails explicitly instead of returning raw
+protocol.
 
 ## Verification
 
@@ -32,7 +36,8 @@ hermes plugins doctor provider --ci
 ```
 
 Regression tests were observed failing before implementation. The full suite
-passes with 54 tests and 449 subtests. Authenticated smoke tests also exercised
+passes with 62 tests and 747 subtests before integration with current main.
+The original PR author reported authenticated smoke tests that exercised
 `auto` and `grok-4.7`: each requested a harmless diagnostic echo tool, the local
 harness executed it, and the model returned its message after receiving the
 actual tool result. These normal live round trips do not prove that every model

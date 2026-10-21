@@ -27,6 +27,9 @@ TOOLS = [{"type": "function", "function": {
 CALL = '<tool_call>' + json.dumps({"id": "recovered", "function": {
     "name": "skill_view", "arguments": {"name": "payroll-record-organization"},
 }}) + '</tool_call>'
+MALFORMED_CALL = CALL.replace(
+    '"arguments": {"name": "payroll-record-organization"}', '"arguments": "{not json"')
+UNOFFERED_CALL = CALL.replace('"name": "skill_view"', '"name": "shell_exec"')
 
 
 class OfflineRun:
@@ -200,6 +203,148 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(response.choices[0].message.content, text)
                 self.assertEqual(response.choices[0].finish_reason, "stop")
                 self.assertEqual(len(self.sdk.messages), count + 1)
+
+    def test_substantive_clause_after_action_opening_is_not_retried(self):
+        examples = [
+            "I'll check the config values: they match the defaults.",
+            "Let me check the three options: alpha, beta, and gamma.",
+            "I'll review the diff: only the client changed.",
+            "I'll check the logs - nothing stands out.",
+            "I'll check the logs — nothing stands out.",
+            "I'll verify the numbers; all three agree.",
+        ]
+        for text in examples:
+            with self.subTest(text=text):
+                self.sdk.runs.append(OfflineRun(text))
+                count = len(self.sdk.messages)
+                response = self.request()
+                self.assertEqual(response.choices[0].message.content, text)
+                self.assertEqual(response.choices[0].finish_reason, "stop")
+                self.assertEqual(len(self.sdk.messages), count + 1)
+
+    def test_substantive_clause_answer_streams_at_every_split_boundary(self):
+        text = "I'll check the config values: they match the defaults."
+        for split in range(1, len(text)):
+            with self.subTest(split=split):
+                self.sdk.runs.clear()
+                self.sdk.runs.append(OfflineRun(text, [text[:split], text[split:]]))
+                count = len(self.sdk.messages)
+                chunks = list(self.request(stream=True))
+                content = "".join(
+                    c.choices[0].delta.content or "" for c in chunks if c.choices)
+                self.assertEqual(content, text)
+                self.assertEqual(len(self.sdk.messages), count + 1)
+
+    def test_invalid_block_after_announcement_recovers_at_every_split_boundary(self):
+        text = ANNOUNCEMENT + "\n" + MALFORMED_CALL
+        for split in range(1, len(text)):
+            with self.subTest(split=split):
+                self.sdk.runs.clear()
+                self.sdk.runs.extend([
+                    OfflineRun(text, [text[:split], text[split:]]), OfflineRun(CALL),
+                ])
+                before = len(self.sdk.messages)
+                chunks = list(self.request(stream=True))
+                content = "".join(
+                    c.choices[0].delta.content or "" for c in chunks if c.choices)
+                calls = [call for c in chunks if c.choices
+                         for call in (c.choices[0].delta.tool_calls or [])]
+                self.assertEqual(content, "")
+                self.assertEqual([call.function.name for call in calls], ["skill_view"])
+                self.assertEqual(len(self.sdk.messages) - before, 2)
+                self.assertFalse(self.sdk.runs)
+
+    def test_invalid_or_unoffered_block_after_announcement_recovers_without_leaking(self):
+        for separator in ("\n", " ", "\n\n", "\t"):
+            for block in (MALFORMED_CALL, UNOFFERED_CALL):
+                for streaming in (False, True):
+                    with self.subTest(separator=separator, block=block, streaming=streaming):
+                        self.sdk.runs.clear()
+                        self.sdk.runs.extend([
+                            OfflineRun(ANNOUNCEMENT + separator + block), OfflineRun(CALL),
+                        ])
+                        before = len(self.sdk.messages)
+                        response = self.request(stream=streaming)
+                        if streaming:
+                            chunks = list(response)
+                            content = "".join(
+                                c.choices[0].delta.content or "" for c in chunks if c.choices)
+                            calls = [call for c in chunks if c.choices
+                                     for call in (c.choices[0].delta.tool_calls or [])]
+                        else:
+                            content = response.choices[0].message.content or ""
+                            calls = response.choices[0].message.tool_calls or []
+                        self.assertEqual(content, "")
+                        self.assertEqual([call.function.name for call in calls], ["skill_view"])
+                        self.assertEqual(len(self.sdk.messages) - before, 2)
+                        self.assertFalse(self.sdk.runs)
+
+    def test_malformed_block_before_valid_call_is_not_returned_or_stored(self):
+        for streaming in (False, True):
+            for label, block in (("malformed", MALFORMED_CALL), ("unoffered", UNOFFERED_CALL)):
+                with self.subTest(streaming=streaming, block=label):
+                    self.sdk.runs.clear()
+                    self.sdk.runs.append(
+                        OfflineRun(ANNOUNCEMENT + "\n" + block + "\n" + CALL))
+                    before = len(self.sdk.messages)
+                    response = self.request(
+                        stream=streaming, _cursor_session_scope=f"mixed-{streaming}-{label}")
+                    if streaming:
+                        chunks = list(response)
+                        content = "".join(
+                            c.choices[0].delta.content or "" for c in chunks if c.choices)
+                        calls = [call for c in chunks if c.choices
+                                 for call in (c.choices[0].delta.tool_calls or [])]
+                    else:
+                        content = response.choices[0].message.content or ""
+                        calls = response.choices[0].message.tool_calls or []
+                    self.assertEqual(content, ANNOUNCEMENT)
+                    self.assertEqual([call.function.name for call in calls], ["skill_view"])
+                    self.assertEqual(len(self.sdk.messages) - before, 1)
+                    session = adapter._SESSIONS[next(reversed(adapter._SESSIONS))]
+                    self.assertEqual(session.history[-1]["content"], ANNOUNCEMENT)
+                    self.assertNotIn("<tool_call>", json.dumps(session.history))
+
+    def test_rejected_block_alone_recovers_instead_of_leaking_raw_protocol(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.sdk.runs.clear()
+                self.sdk.runs.extend([OfflineRun(MALFORMED_CALL), OfflineRun(CALL)])
+                before = len(self.sdk.messages)
+                response = self.request(stream=streaming)
+                if streaming:
+                    chunks = list(response)
+                    content = "".join(
+                        c.choices[0].delta.content or "" for c in chunks if c.choices)
+                    calls = [call for c in chunks if c.choices
+                             for call in (c.choices[0].delta.tool_calls or [])]
+                else:
+                    content = response.choices[0].message.content or ""
+                    calls = response.choices[0].message.tool_calls or []
+                self.assertEqual(content, "")
+                self.assertEqual([call.function.name for call in calls], ["skill_view"])
+                self.assertEqual(len(self.sdk.messages) - before, 2)
+                self.assertFalse(self.sdk.runs)
+
+    def test_usage_sums_discarded_recovery_attempts(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.sdk.runs.clear()
+                discarded = OfflineRun(ANNOUNCEMENT)
+                discarded.wait = lambda: SimpleNamespace(
+                    result=discarded.text, status="FINISHED",
+                    usage=SimpleNamespace(
+                        input_tokens=1000, output_tokens=500,
+                        cache_read_tokens=30, cache_write_tokens=20),
+                    model=SimpleNamespace(id="auto"))
+                self.sdk.runs.extend([discarded, OfflineRun(CALL)])
+                response = self.request(stream=streaming)
+                usage = list(response)[-1].usage if streaming else response.usage
+                self.assertEqual(usage.prompt_tokens, 1004)
+                self.assertEqual(usage.completion_tokens, 502)
+                self.assertEqual(usage.total_tokens, 1506)
+                self.assertEqual(usage.prompt_tokens_details.cached_tokens, 30)
+                self.assertEqual(usage.prompt_tokens_details.cache_write_tokens, 20)
 
     def test_no_tools_disabled_tools_and_title_requests_do_not_recover(self):
         for tools, choice in ((None, None), ([], "required"), (TOOLS, "none")):

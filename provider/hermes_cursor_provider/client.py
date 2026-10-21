@@ -214,7 +214,8 @@ def _action_only(text: str, *, partial: bool = False) -> bool:
     # identifier (e.g. should_retry). Release only on an observed delimiter.
     boundary = r"(?=\W)" if partial else r"\b"
     if re.search(
-        r"[?\n]|[.!]\s+\S|\b(if|unless|could|would|want|once|when|after|before|should|upon)"
+        r"[?\n]|[.!]\s+\S|[:;]\s|\s[-–—]\s"
+        r"|\b(if|unless|could|would|want|once|when|after|before|should|upon)"
         + boundary + r"|\brun through" + boundary, value
     ):
         return False
@@ -329,6 +330,26 @@ def _usage(result: Any) -> Any:
     )
 
 
+def _aggregate_result(attempts: list[Any]) -> Any:
+    """Sum billed usage across discarded recovery attempts, keeping the final model."""
+    result = attempts[-1]
+    if len(attempts) == 1:
+        return result
+
+    def total(name: str) -> int:
+        return sum(int(getattr(getattr(item, "usage", None), name, 0) or 0) for item in attempts)
+
+    return SimpleNamespace(
+        model=getattr(result, "model", None),
+        usage=SimpleNamespace(
+            input_tokens=total("input_tokens"),
+            output_tokens=total("output_tokens"),
+            cache_read_tokens=total("cache_read_tokens"),
+            cache_write_tokens=total("cache_write_tokens"),
+        ),
+    )
+
+
 def _tool_delta(call: Any, index: int) -> Any:
     return SimpleNamespace(
         index=index,
@@ -380,7 +401,8 @@ class _ToolBlockStream:
 
     Emits ordinary text as soon as it is safe and buffers only a possibly-incomplete
     tool block, so arbitrary stream splits never tear a validated call. Blocks that do
-    not validate are re-emitted verbatim, matching ``extract_tool_calls``."""
+    not validate are emitted as ``rejected`` events and re-emitted verbatim as text,
+    matching ``extract_tool_calls``."""
 
     _OPEN = "<tool_call>"
     _CLOSE = "</tool_call>"
@@ -428,7 +450,7 @@ class _ToolBlockStream:
                 len(self.calls) + 1,
             )
             if call is None:
-                yield ("text", self._record(block))
+                yield ("rejected", self._record(block))
             else:
                 self.calls.append(call)
                 yield ("call", call)
@@ -454,7 +476,8 @@ class _ToolBlockStream:
     def flush(self) -> Iterable[tuple[str, Any]]:
         if self._buffer:
             tail, self._buffer = self._buffer, ""
-            yield ("text", self._record(tail))
+            kind = "rejected" if tail.lstrip().startswith(self._OPEN) else "text"
+            yield (kind, self._record(tail))
 
     def _record(self, part: str) -> str:
         if part:
@@ -811,11 +834,13 @@ class CursorSDKClient:
     ) -> Any:
         """Keep a short action-only preamble private until its turn is usable."""
         require_call = bool(allowed_names) and require_call
+        attempts: list[Any] = []
         for attempt in range(3):
             execution = self._run_agent_once(
                 agent, prompt=prompt, images=images, allowed_names=allowed_names, control=control
             )
             held: list[tuple[str, Any]] = []
+            dropped: list[str] = []
             holding = bool(allowed_names)
             try:
                 while True:
@@ -823,12 +848,21 @@ class CursorSDKClient:
                         event = next(execution)
                     except StopIteration as stop:
                         result, calls, content = stop.value
+                        attempts.append(result)
                         break
                     if holding:
                         held.append(event)
-                        if event[0] == "call" or (not require_call and not _action_only("".join(
+                        if event[0] == "call":
+                            holding = False
+                            # A rejected block in a turn that produced a valid call is
+                            # discarded protocol, not answer text.
+                            dropped.extend(
+                                value for kind, value in held if kind == "rejected")
+                            yield from (item for item in held if item[0] != "rejected")
+                            held.clear()
+                        elif not require_call and not _action_only("".join(
                             value for kind, value in held if kind == "text"
-                        ), partial=True)):
+                        ), partial=True):
                             holding = False
                             yield from held
                             held.clear()
@@ -836,9 +870,13 @@ class CursorSDKClient:
                         yield event
             finally:
                 execution.close()
-            if calls or not (require_call or (allowed_names and _action_only(content))):
+            rejected = any(kind == "rejected" for kind, _ in held)
+            if calls or not (require_call or (allowed_names and (
+                    rejected or _action_only(content)))):
                 yield from held
-                return result, calls, content
+                for block in dropped:
+                    content = content.replace(block, "", 1)
+                return _aggregate_result(attempts), calls, content.strip()
             if attempt == 2:
                 raise CursorSDKRunError(
                     "Cursor returned no valid Hermes tool call for a required or announced action; "

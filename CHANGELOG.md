@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Adds bounded recovery for short action-only replies and unsatisfied required tool choices, without enabling Cursor-native tools.
+- Keeps substantive first-person answers that continue after a colon, semicolon, or spaced dash out of action-only recovery, and treats malformed or unoffered tool blocks after an announcement as rejected protocol instead of leaking raw XML as the final answer.
+- Keeps buffered answers, streamed output, and retained history consistent when rejected protocol is withheld; reports usage summed across discarded recovery attempts, including cache reads and writes.
+
 ## 0.3.6
 
 - Replaces synthesized, post-completion chunks with genuine incremental SDK text streaming for Hermes Relay and async consumers. Awaiting a stream no longer collects the whole run.
