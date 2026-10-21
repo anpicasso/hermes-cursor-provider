@@ -11,6 +11,8 @@
 - Native calls are only converted on a final (completed or error) event, using that event's arguments (pending args from earlier running events are the fallback); calls still unfinished when the run ends are converted then.
 - Diagnostics: warnings through the `hermes_cursor_provider` logger; bounded event metadata only (never raw arguments, results, or rejected blocks) to `<HERMES_HOME>/logs/cursor-provider-events.jsonl` when `HERMES_CURSOR_DEBUG_EVENTS=1`. Log files use owner-only permissions. Adds `scripts/native_tool_probe.py`.
 - Resets incomplete-block parser state before corrective retries, deduplicates native calls through the shared acceptance path, and forwards contiguous terminal-event siblings before cancelling the intercepted run.
+- Adds Cursor model parameter selection: `model@key=value,...` (e.g. `grok-4.7@fast=true,reasoning_effort=xhigh`) is sent to the SDK as `{id, params}`. Malformed suffixes fail before the bridge launches; parameter ids and values are checked against the account's `list_models()` catalog before agent creation. Parameter variants get separate retained sessions, independent of parameter order, and `context=` sets Hermes' compression budget. Automatic mapping of Hermes `/reasoning` settings is not included.
+- Adds opt-in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) so chosen parameter variants appear in the model listing and pass Hermes' `/model` validation; unsupported ids/values are skipped.
 - Logs a warning when the model list cannot be loaded (for example, `cursor-sdk` is not installed in Hermes' Python environment) instead of silently showing only the seed models.
 - README: troubleshooting for a model picker that shows only `auto` and `composer-2.5`.
 
