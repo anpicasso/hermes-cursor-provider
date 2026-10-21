@@ -754,6 +754,20 @@ def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block, monkeypatch)
         client.close()
 
 
+def test_stream_keeps_incomplete_block_as_verbatim_text():
+    text = 'Example: <tool_call>{"function": {"name": "read_file", "arguments": "{}"'
+    assert extract_tool_calls(text, {"read_file"}) == ([], text)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        for split in (len("Example: <tool"), len(text) // 2, len(text)):
+            _, calls, content = _collect_scripted(client, sdk, text, split)
+            assert calls == [], split
+            assert content == text, (split, content)
+    finally:
+        client.close()
+
+
 def test_stream_does_not_repeat_terminal_text_already_streamed():
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()

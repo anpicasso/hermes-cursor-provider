@@ -6,7 +6,9 @@
 - Matches model-written tool names against offered tools (prefixes like `functions.`/`mcp_`, CamelCase, unique multi-word suffix) and unwraps Cursor's `CallMcpTool` wrapper.
 - Accepts `<tool_call>` JSON without the `function` wrapper (`name` + `arguments`/`parameters`/`args`/`input`).
 - Stronger prompt rules: Hermes tools are not native, "Tool not found" means wrong channel, never claim tools are unavailable; the rule is repeated right before the final transcript entry.
-- One corrective retry when a turn has no valid call but shows an unknown native tool or a rejected `<tool_call>` block. Disable with `HERMES_CURSOR_RETRY=0`.
+- Adds bounded recovery for short action-only replies and unsatisfied required/named tool choices, without enabling Cursor-native tools. Recovery is shared and not nested: an unknown native tool or a rejected `<tool_call>` block gets one corrective retry, action-only or required/named turns get up to two nudges. Disable with `HERMES_CURSOR_RETRY=0`.
+- Keeps substantive first-person answers that continue after a colon, semicolon, or spaced dash out of action-only recovery, and treats malformed or unoffered tool blocks after an announcement as rejected protocol instead of leaking raw XML as the final answer.
+- Keeps buffered answers, streamed output, and retained history consistent when rejected protocol is withheld; reports usage summed across discarded recovery attempts, including cache reads and writes.
 - Resets a retained SDK agent after a failed tool-call turn so later turns do not inherit "Tool not found" history. Disable with `HERMES_CURSOR_RESET_POISONED=0`.
 - Native calls are only converted on a final (completed or error) event, using that event's arguments (pending args from earlier running events are the fallback); calls still unfinished when the run ends are converted then.
 - Diagnostics: warnings through the `hermes_cursor_provider` logger; bounded event metadata only (never raw arguments, results, or rejected blocks) to `<HERMES_HOME>/logs/cursor-provider-events.jsonl` when `HERMES_CURSOR_DEBUG_EVENTS=1`. Log files use owner-only permissions. Adds `scripts/native_tool_probe.py`.

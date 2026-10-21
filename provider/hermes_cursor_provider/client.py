@@ -296,6 +296,34 @@ def render_prompt(
     return "\n\n".join(sections), allowed
 
 
+_ACTION_STARTS = tuple(
+    f"{intro} {verb} "
+    for intro in ("i'll", "i will", "let me", "i'm going to")
+    for verb in ("load", "read", "check", "inspect", "search", "look up", "run", "open", "fetch", "review", "verify")
+)
+
+
+def _action_only(text: str, *, partial: bool = False) -> bool:
+    """Conservatively recognize one short, unconditional tool-action announcement.
+
+    The partial form also holds split opening words, never a whole ordinary stream.
+    """
+    value = text.strip().lower().replace("’", "'")
+    if len(value) > 320 or len(value.split()) > 60:
+        return False
+    # A terminal word boundary can disappear when the next chunk extends an
+    # identifier (e.g. should_retry). Release only on an observed delimiter.
+    boundary = r"(?=\W)" if partial else r"\b"
+    if re.search(
+        r"[?\n]|[.!]\s+\S|[:;]\s|\s[-–—]\s"
+        r"|\b(if|unless|could|would|want|once|when|after|before|should|upon)"
+        + boundary + r"|\brun through" + boundary, value
+    ):
+        return False
+    return any(value.startswith(start) or (partial and start.startswith(value))
+               for start in _ACTION_STARTS)
+
+
 def _image_payload(url: str) -> dict[str, str] | None:
     value = url.strip()
     if value.startswith("https://"):
@@ -440,6 +468,26 @@ def _usage(result: Any) -> Any:
     )
 
 
+def _aggregate_result(attempts: list[Any]) -> Any:
+    """Sum billed usage across discarded recovery attempts, keeping the final model."""
+    result = attempts[-1]
+    if len(attempts) == 1:
+        return result
+
+    def total(name: str) -> int:
+        return sum(int(getattr(getattr(item, "usage", None), name, 0) or 0) for item in attempts)
+
+    return SimpleNamespace(
+        model=getattr(result, "model", None),
+        usage=SimpleNamespace(
+            input_tokens=total("input_tokens"),
+            output_tokens=total("output_tokens"),
+            cache_read_tokens=total("cache_read_tokens"),
+            cache_write_tokens=total("cache_write_tokens"),
+        ),
+    )
+
+
 def _tool_delta(call: Any, index: int) -> Any:
     return SimpleNamespace(
         index=index,
@@ -491,7 +539,8 @@ class _ToolBlockStream:
 
     Emits ordinary text as soon as it is safe and buffers only a possibly-incomplete
     tool block, so arbitrary stream splits never tear a validated call. Blocks that do
-    not validate are re-emitted verbatim, matching ``extract_tool_calls``."""
+    not validate are emitted as ``rejected`` events and re-emitted verbatim as text,
+    matching ``extract_tool_calls``."""
 
     _OPEN = "<tool_call>"
     _CLOSE = "</tool_call>"
@@ -546,7 +595,7 @@ class _ToolBlockStream:
                 self.rejected += 1
                 _LOG.warning("cursor provider: rejected an unusable <tool_call> block (%d chars)", len(block))
                 _debug_event("rejected_tool_block", chars=len(block))
-                yield ("text", self._record(block))
+                yield ("rejected", self._record(block))
             else:
                 for call in found:
                     if self._accept(call):
@@ -601,7 +650,8 @@ class _ToolBlockStream:
             # reused for a corrective retry; a fresh block must start scanning from the opener.
             self._scan = len(self._OPEN)
             self._quoted = self._escaped = False
-            yield ("text", self._record(tail))
+            kind = "rejected" if tail.lstrip().startswith(self._OPEN) else "text"
+            yield (kind, self._record(tail))
 
     def _record(self, part: str) -> str:
         if part:
@@ -1224,15 +1274,126 @@ class CursorSDKClient:
         prompt: str,
         images: list[dict[str, str]],
         allowed_names: set[str],
+        require_call: bool = False,
         control: _StreamControl | None = None,
         info: dict[str, Any] | None = None,
     ) -> Any:
-        """Run one agent turn, yielding ('text'|'call', value) events as they stream.
+        """Run one logical turn with bounded, shared corrective recovery.
+
+        Each attempt is exactly one SDK run (``_run_agent_once``), so retries are never
+        nested or multiplied. A turn is accepted when it produced a valid call or an
+        ordinary answer. Recovery covers required/named tool choices, short action-only
+        announcements, unknown native tool names, and rejected blocks; native/rejected
+        evidence keeps PR1's one-retry bound, action/required recovery gets PR3's two.
+        """
+        require_call = bool(allowed_names) and require_call
+        info = info if info is not None else {}
+        attempts: list[Any] = []
+        budget: int | None = None
+        fail_on_exhaustion = False
+        for attempt in range(3):
+            attempt_info: dict[str, Any] = {}
+            execution = self._run_agent_once(
+                agent, prompt=prompt, images=images, allowed_names=allowed_names,
+                control=control, info=attempt_info,
+            )
+            held: list[tuple[str, Any]] = []
+            dropped: list[str] = []
+            holding = bool(allowed_names)
+            try:
+                while True:
+                    try:
+                        event = next(execution)
+                    except StopIteration as stop:
+                        result, calls, content = stop.value
+                        attempts.append(result)
+                        break
+                    if holding:
+                        held.append(event)
+                        if event[0] == "call":
+                            holding = False
+                            # A rejected block in a turn that produced a valid call is
+                            # discarded protocol, not answer text.
+                            dropped.extend(
+                                value for kind, value in held if kind == "rejected")
+                            yield from (item for item in held if item[0] != "rejected")
+                            held.clear()
+                        elif not require_call and not _action_only("".join(
+                            value for kind, value in held if kind == "text"
+                        ), partial=True):
+                            holding = False
+                            yield from held
+                            held.clear()
+                    else:
+                        yield event
+            finally:
+                execution.close()
+            attempt_misses = list(attempt_info.get("misses", ()))
+            info["native_misses"] = info.get("native_misses", 0) + attempt_info.get("native_misses", 0)
+            info["intercepted"] = info.get("intercepted", 0) + attempt_info.get("intercepted", 0)
+            info["rejected"] = info.get("rejected", 0) + attempt_info.get("rejected", 0)
+            rejected = any(kind == "rejected" for kind, _ in held)
+            held_text = "".join(value for kind, value in held if kind == "text")
+            announced = bool(allowed_names) and _action_only(held_text or content)
+            recovery = _flag("HERMES_CURSOR_RETRY", True) and bool(allowed_names) and (
+                require_call or announced or rejected or bool(attempt_misses)
+            )
+            if calls or not recovery:
+                yield from held
+                for block in dropped:
+                    content = content.replace(block, "", 1)
+                return _aggregate_result(attempts), calls, content.strip()
+            if budget is None:
+                # Native/rejected evidence keeps the original single corrective retry;
+                # required/named and announced actions get up to two nudges.
+                fail_on_exhaustion = require_call or announced
+                budget = 2 if fail_on_exhaustion else 1
+            elif announced and budget < 2:
+                # A retry that now announces an action inherits the action budget.
+                fail_on_exhaustion = True
+                budget = 2
+            if attempt >= budget:
+                if fail_on_exhaustion:
+                    raise CursorSDKRunError(
+                        "Cursor returned no valid Hermes tool call for a required or announced action; "
+                        "recovery exhausted. No tool action was executed by the adapter."
+                    )
+                yield from held
+                for block in dropped:
+                    content = content.replace(block, "", 1)
+                return _aggregate_result(attempts), calls, content.strip()
+            info["retried"] = True
+            # Once recovery starts, only a validated call can satisfy the promised action.
+            require_call = True
+            # One prompt covers both intents: name the native misses/rejections, list every
+            # offered tool, and forbid another announcement or completion claim.
+            prompt = render_correction(
+                allowed_names, attempt_misses, attempt_info.get("rejected", 0)
+            ) + " No tool was executed. Do not repeat an action announcement or claim completion. Hermes alone executes tools."
+            _LOG.warning(
+                "cursor provider: no valid tool call (native misses=%d, rejected blocks=%d); "
+                "sending corrective retry %d/%d",
+                len(attempt_misses), attempt_info.get("rejected", 0), attempt + 1, budget,
+            )
+            _debug_event("retry", misses=attempt_misses, rejected=attempt_info.get("rejected", 0))
+            images = []
+
+    def _run_agent_once(
+        self,
+        agent: Any,
+        *,
+        prompt: str,
+        images: list[dict[str, str]],
+        allowed_names: set[str],
+        control: _StreamControl | None = None,
+        info: dict[str, Any] | None = None,
+    ) -> Any:
+        """Run exactly one SDK turn, yielding ('text'|'call', value) events as they stream.
 
         Native Cursor tool_call events that name an offered Hermes tool are converted into
-        Hermes calls (HERMES_CURSOR_INTERCEPT_NATIVE, default on). When a turn yields no
-        valid call but shows a native miss or a rejected block, one corrective retry is sent
-        (HERMES_CURSOR_RETRY, default on). ``info`` reports native_misses / intercepted / retried.
+        Hermes calls (HERMES_CURSOR_INTERCEPT_NATIVE, default on). ``info`` reports this
+        attempt's native_misses / misses / intercepted / rejected so ``_run_agent`` can make
+        one shared, bounded recovery decision; no retry happens here.
 
         Returns (result, calls, content) — the extraction the buffered path used,
         produced incrementally so callers see text before the SDK run completes."""
@@ -1241,51 +1402,33 @@ class CursorSDKClient:
         info = info if info is not None else {}
         run = None
         try:
-            message: dict[str, Any] = {"text": prompt, "images": images}
-            for attempt in (0, 1):
-                run = agent.send(message)
+            run = agent.send({"text": prompt, "images": images})
+            with self._runs_lock:
+                self._runs.add(run)
+            if control is not None:
+                control.run = run
+                if control.closed or self.is_closed:
+                    raise CursorSDKRunError("Cursor stream cancelled during startup")
+            try:
+                result, streamed, failure, stopped = yield from self._consume(
+                    run, parser, allowed_names, native
+                )
+            finally:
                 with self._runs_lock:
-                    self._runs.add(run)
-                if control is not None:
-                    control.run = run
-                    if control.closed or self.is_closed:
-                        raise CursorSDKRunError("Cursor stream cancelled during startup")
-                try:
-                    result, streamed, failure, stopped = yield from self._consume(
-                        run, parser, allowed_names, native
-                    )
-                finally:
-                    with self._runs_lock:
-                        self._runs.discard(run)
-                if not stopped:
-                    status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
-                    status = str(status_value or "").upper()
-                    if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
-                        raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
-                    tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
-                    if tail:
-                        yield from parser.feed(tail)
-                yield from parser.flush()
-                info["native_misses"] = len(native["misses"])
-                info["intercepted"] = len(native["intercepted"])
-                needs_retry = (
-                    attempt == 0
-                    and not parser.calls
-                    and allowed_names
-                    and _flag("HERMES_CURSOR_RETRY", True)
-                    and (native["misses"] or parser.rejected)
-                )
-                if not needs_retry:
-                    return result, parser.calls, parser.text
-                info["retried"] = True
-                _LOG.warning(
-                    "cursor provider: no valid tool call (native misses=%d, rejected blocks=%d); sending one corrective retry",
-                    len(native["misses"]), parser.rejected,
-                )
-                _debug_event("retry", misses=native["misses"], rejected=parser.rejected)
-                message = {"text": render_correction(allowed_names, native["misses"], parser.rejected), "images": []}
-                native["misses"] = []
-                parser.rejected = 0
+                    self._runs.discard(run)
+            if not stopped:
+                status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
+                status = str(status_value or "").upper()
+                if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                    raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
+                tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
+                if tail:
+                    yield from parser.feed(tail)
+            yield from parser.flush()
+            info["native_misses"] = len(native["misses"])
+            info["misses"] = list(native["misses"])
+            info["intercepted"] = len(native["intercepted"])
+            info["rejected"] = parser.rejected
             return result, parser.calls, parser.text
         except BaseException:
             if run is not None:
@@ -1308,6 +1451,7 @@ class CursorSDKClient:
         model: str | None,
         timeout: float,
         allowed_names: set[str],
+        require_call: bool = False,
         control: _StreamControl | None = None,
     ) -> Any:
         sessions_root = Path(bridge.workspace.name) / "sessions"
@@ -1323,6 +1467,7 @@ class CursorSDKClient:
                         prompt=prompt,
                         images=images,
                         allowed_names=allowed_names,
+                        require_call=require_call,
                         control=control,
                     )
                 )
@@ -1350,6 +1495,11 @@ class CursorSDKClient:
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)
+        choice = _plain(tool_choice)
+        require_call = choice == "required" or (
+            isinstance(choice, dict) and isinstance(choice.get("function"), dict)
+            and bool(choice["function"].get("name"))
+        )
 
         if not session_scope:
             prompt, allowed_names = render_prompt(
@@ -1363,6 +1513,7 @@ class CursorSDKClient:
                     model=model,
                     timeout=timeout,
                     allowed_names=allowed_names,
+                    require_call=require_call,
                     control=control,
                 )
             )
@@ -1383,6 +1534,7 @@ class CursorSDKClient:
                     model=model,
                     timeout=timeout,
                     allowed_names=allowed_names,
+                    require_call=require_call,
                     control=control,
                 )
             )
@@ -1418,6 +1570,7 @@ class CursorSDKClient:
                 prompt=prompt,
                 images=extract_images(request_messages),
                 allowed_names=allowed_names,
+                require_call=require_call,
                 control=control,
                 info=info,
             )

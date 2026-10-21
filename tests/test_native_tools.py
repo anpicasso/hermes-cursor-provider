@@ -279,6 +279,27 @@ def test_unknown_native_tool_triggers_one_corrective_retry_that_succeeds():
         client.close()
 
 
+def test_action_recovery_with_native_miss_is_shared_not_nested():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    block = '<tool_call>{"id":"c9","type":"function","function":{"name":"kanban_create","arguments":"{\\"title\\":\\"t\\"}"}}</tool_call>'
+    try:
+        _, agent = _sequence(sdk, [
+            [_native("browser_exec", {}, status="error", result="Tool not found"),
+             _assistant_event("I'll check the board now.")],
+            [_native("browser_exec", {}, status="error", result="Tool not found"),
+             _assistant_event("I'll check the board now.")],
+            [_assistant_event(block)],
+        ])
+        calls = _stream_calls(_stream(client))
+        assert [c.function.name for c in calls] == ["kanban_create"]
+        # One action budget (initial + two nudges), not an outer x inner product.
+        assert len(agent.messages) == 3
+        assert "browser_exec" in agent.messages[1]["text"]
+    finally:
+        client.close()
+
+
 def test_retry_after_incomplete_block_parses_the_corrected_call():
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
