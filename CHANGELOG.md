@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Logs a warning when the model list cannot be loaded (for example, `cursor-sdk` is not installed in Hermes' Python environment) instead of silently showing only the seed models.
+- README: troubleshooting for a model picker that shows only `auto` and `composer-2.5`.
+
 ## 0.3.6
 
 - Replaces synthesized, post-completion chunks with genuine incremental SDK text streaming for Hermes Relay and async consumers. Awaiting a stream no longer collects the whole run.
