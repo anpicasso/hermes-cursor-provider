@@ -43,11 +43,13 @@ hermes chat --provider cursor --model auto -q 'Reply with exactly: OK'
 Cursor models expose parameters such as reasoning effort, fast mode and context size (see each model's `parameters` in the SDK's `list_models()`). Append them to the model name as `@key=value,...`:
 
 ```bash
-hermes chat --provider cursor --model 'grok-4.7@reasoning_effort=xhigh,fast=true' -q 'Reply with exactly: OK'
+hermes chat --provider cursor --model 'grok-4.7@fast=true,reasoning_effort=xhigh' -q 'Reply with exactly: OK'
 hermes chat --provider cursor --model 'claude-opus-5-5@context=1m,effort=max' -q 'Reply with exactly: OK'
 ```
 
-Without a suffix, Cursor picks the model's default variant. Malformed suffixes fail before a run starts, and Cursor rejects unknown values (`Invalid parameters for registry model`) instead of silently falling back. Each parameter combination gets its own retained agent.
+Without a suffix, Cursor picks the model's default variant. Parameter ids and values are checked against your account's `list_models()` catalog before an agent is created, so a malformed or unsupported selection fails with an error instead of silently using the default variant. The catalog must be reachable for a parameterised run. Each parameter combination gets its own retained agent; parameter order does not matter. A `context=` parameter also sets the context budget Hermes uses for compression.
+
+Hermes' `/reasoning` and `delegation.reasoning_effort` settings are **not** mapped onto Cursor parameters automatically. Select the model's own parameter explicitly with the `@key=value` suffix (for example `grok-4.7@reasoning_effort=xhigh`).
 
 Hermes' `/model` command only accepts names from the provider's model listing. To make chosen variants selectable there, list them in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) in the profile's `.env`:
 
@@ -55,7 +57,7 @@ Hermes' `/model` command only accepts names from the provider's model listing. T
 HERMES_CURSOR_MODEL_VARIANTS=grok-4.7@context=500k,reasoning_effort=xhigh,fast=true
 ```
 
-Listed variants are appended to the model listing in normalised form; malformed entries, bare ids and variants of models your account cannot see are skipped.
+Listed variants are appended to the model listing in normalised form; malformed entries, bare ids, variants of models your account cannot see, and unsupported parameter ids or values are skipped. If the picker already cached the model list, run `hermes model --refresh` after changing `HERMES_CURSOR_MODEL_VARIANTS`.
 
 A running gateway may retain the previous provider import. After install or upgrade, restart it from an external shell:
 
@@ -84,6 +86,7 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 ## Current limitations
 
 - Cursor SDK `1.x` is proprietary beta software and may change; the plugin pins the supported major version.
+- Model parameters are explicit only: Hermes' `/reasoning` and `delegation.reasoning_effort` settings are not mapped automatically onto Cursor's `reasoning_effort`/`effort` parameters.
 - The plugin does not request Cursor's optional local sandbox because the SDK rejects it on unsupported hosts. Security does not depend on that sandbox: Cursor built-in tools, custom tools, and MCP servers remain disabled, and Hermes owns tool execution.
 - Text streams incrementally from the SDK to Hermes, including managed Relay and async auxiliary consumers. Only incomplete tool-call blocks and trailing whitespace are held back; validated tool calls remain under Hermes' execution and approval loop. Usage and the finish marker arrive when the SDK run ends. A terminal-only SDK response cannot provide earlier text.
 - Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop.
