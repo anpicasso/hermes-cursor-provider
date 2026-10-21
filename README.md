@@ -94,6 +94,7 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 - Up to 16 idle conversation agents are retained per process by default (`HERMES_CURSOR_MAX_SESSIONS` changes the LRU target); active turns can temporarily exceed it. A history rewrite/compaction starts a fresh agent; concurrent turns on one conversation use an isolated one-shot agent.
 - Agent reuse ends on process restart. Cross-process SDK resume is deliberately not enabled yet.
 - Cursor cache reads and writes are reported through Hermes usage metadata; Cursor's billed `Agent.get_usage()` endpoint may remain unavailable for some accounts.
+- `usage.prompt_tokens` reports the run's **largest single turn**, not the SDK's run-wide sum. Cursor's guide defines `run.usage` / `result.usage` as "summed across every turn that reported usage", while the `usage` stream event carries one turn's own numbers; Hermes reads `usage.prompt_tokens` as the size of the request it just sent and anchors compression on it. A summed total can place a session above its own context window and fail every later turn closed as "too large to compress further". The peak is used rather than the last event because a run's turns are not ordered by size; a run that emits no `usage` event keeps reporting its `result.usage`.
 - Live inference needs a real Cursor API key and is not exercised by the public CI suite.
 
 ## Development

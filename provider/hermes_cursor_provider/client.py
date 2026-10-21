@@ -17,7 +17,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
@@ -466,6 +466,47 @@ def _usage(result: Any) -> Any:
             cache_write_tokens=written,
         ),
     )
+
+
+def _prompt_size(usage: Any) -> int:
+    """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
+    try:
+        return int(getattr(usage, "input_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _with_peak_turn_usage(result: Any, turn_usage: Any) -> Any:
+    """Report the run's LARGEST per-turn usage instead of the SDK's run-wide sum.
+
+    Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage``
+    hold a ``TokenUsage`` "summed across every turn that reported usage", while the
+    ``usage`` stream event carries one turn's own numbers. Hermes reads
+    ``usage.prompt_tokens`` as the size of the request it just sent — it is the
+    compression anchor (``agent/usage_anchor.py``: "the provider's real
+    ``usage.prompt_tokens`` is the only authoritative context size") and the input to a
+    session budget. Reporting the run total therefore inflates the session by the number
+    of turns the run took: one observed run reported 598,980 for a ~241,305-token prompt,
+    which anchored a 33-message session above its 500,000 window so every later turn
+    failed closed as "too large to compress further" — the transcript held ~16k tokens,
+    so no compression pass could ever help.
+
+    The PEAK, not the last: a run that reports several turns need not finish with its
+    largest prompt (one live thread measured 14,191 then 8,686 on consecutive calls), so
+    "whatever arrived last" can understate the context — the direction that lets a
+    session overflow before compression fires. The peak stays inside the documented
+    contract (one turn's numbers) and can never exceed a single turn, so the sum can
+    never come back.
+
+    Degrades to the result's own usage when no per-turn event was seen or the result
+    refuses the swap; a missing number must never fail a run.
+    """
+    if turn_usage is None:
+        return result
+    try:
+        return replace(result, usage=turn_usage)
+    except Exception:  # noqa: BLE001 - diagnostics must not fail a turn
+        return result
 
 
 def _aggregate_result(attempts: list[Any]) -> Any:
@@ -1178,6 +1219,9 @@ class CursorSDKClient:
         failure = ""
         stopped = False
         stopping = False
+        # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
+        # run-wide sum, so it can never stand in for one prompt (see _with_peak_turn_usage).
+        peak_usage: Any = None
         stream = getattr(run, "stream", None)
         if callable(stream):
             for event in cast(Iterable[Any], stream()):
@@ -1199,6 +1243,16 @@ class CursorSDKClient:
                     status = str(getattr(event, "status", "") or "").upper()
                     if status in {"ERROR", "CANCELLED", "EXPIRED"}:
                         failure = str(getattr(event, "message", "") or status)
+                elif kind == "usage":
+                    # One event per turn that reported usage, carrying THAT turn's numbers
+                    # (Cursor Python guide, "Token usage"). Keep the LARGEST: a run that
+                    # reports several turns need not finish with its biggest prompt, and
+                    # the thread's peak is the conservative reading for a compression anchor.
+                    turn_usage = getattr(event, "usage", None)
+                    if turn_usage is not None and _prompt_size(turn_usage) > _prompt_size(
+                        peak_usage
+                    ):
+                        peak_usage = turn_usage
                 elif kind == "tool_call":
                     name = getattr(event, "name", "")
                     status = str(getattr(event, "status", "") or "").lower()
@@ -1265,6 +1319,8 @@ class CursorSDKClient:
             result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
             return result, streamed, "", True
         result = run.wait()
+        # Prefer this run's peak per-turn usage over the SDK's run-wide sum.
+        result = _with_peak_turn_usage(result, peak_usage)
         return result, streamed, failure, False
 
     def _run_agent(

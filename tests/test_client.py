@@ -1452,3 +1452,123 @@ def test_listing_skips_malformed_unknown_bare_and_duplicate_variants(monkeypatch
         "grok-4.7",
         "composer-2.5@fast=true",
     ]
+
+
+def _usage_of(tokens, *, output=0, cached=0, written=0):
+    """One SDK ``TokenUsage``-shaped record holding a single turn's numbers."""
+    return SimpleNamespace(
+        input_tokens=tokens,
+        output_tokens=output,
+        cache_read_tokens=cached,
+        cache_write_tokens=written,
+    )
+
+
+def test_reported_prompt_tokens_is_one_turn_not_the_run_total():
+    """Hermes reads ``usage.prompt_tokens`` as the size of the request it just sent.
+
+    It anchors compression and the session budget on that number, so the adapter must
+    report one prompt — not the run total the Cursor SDK hands back in ``result.usage``.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(598_980)
+        _scripted_run(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(240_000)),
+                SimpleNamespace(type="usage", usage=_usage_of(241_305)),
+                _assistant_event("done"),
+            ],
+        )
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    assert response.usage.prompt_tokens == 241_305, (
+        "reported the run's cumulative input instead of a single turn's prompt"
+    )
+
+
+def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
+    """A run that reports several turns must keep the peak, not whatever arrived last.
+
+    Cursor's per-turn ``input_tokens`` is not a stable thread size: one live thread
+    measured 14,191 then 8,686 across calls. Keeping the last event would understate the
+    context, which lets a session overflow before compression fires.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(21_995)
+        _scripted_run(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(13_778)),
+                SimpleNamespace(type="usage", usage=_usage_of(8_217)),
+                _assistant_event("done"),
+            ],
+        )
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    assert response.usage.prompt_tokens == 13_778, (
+        "a smaller later turn overwrote the peak prompt reading"
+    )
+
+
+def test_no_usage_event_falls_back_to_the_run_result():
+    """A runtime that emits no per-turn event must keep reporting its result usage."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(1234)
+        _scripted_run(sdk, [_assistant_event("done")])
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    assert response.usage.prompt_tokens == 1234
+
+
+def test_streaming_path_reports_the_peak_turn_usage():
+    """The streaming builder reads the same swapped result, so its final chunk agrees."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(300_000)
+        _scripted_run(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(120_000)),
+                SimpleNamespace(type="usage", usage=_usage_of(180_000)),
+                _assistant_event("done"),
+            ],
+        )
+        chunks = list(
+            client.chat.completions.create(
+                model="auto", messages=[{"role": "user", "content": "hi"}], stream=True
+            )
+        )
+    finally:
+        client.close()
+    final = [chunk for chunk in chunks if getattr(chunk, "usage", None)]
+    assert final, "no usage-bearing chunk was emitted"
+    assert final[-1].usage.prompt_tokens == 180_000
+
+
+def test_a_result_that_cannot_be_swapped_keeps_its_own_usage():
+    """``replace()`` needs a dataclass; an object that refuses it must not fail the turn."""
+    opaque = SimpleNamespace(usage=_usage_of(4242))
+    swapped = client_module._with_peak_turn_usage(opaque, _usage_of(77))
+    assert swapped is opaque
+    assert swapped.usage.input_tokens == 4242
