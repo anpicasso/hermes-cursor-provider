@@ -18,7 +18,7 @@ Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin ret
 ## Install
 
 ```bash
-hermes plugins install 'https://github.com/anpicasso/hermes-cursor-provider.git#provider' --enable
+hermes plugins install cursor-provider
 hermes auth add cursor
 hermes model
 ```
@@ -28,7 +28,7 @@ Create a **user API key** at <https://cursor.com/dashboard/api>. User and servic
 Plugins and credentials are profile-scoped:
 
 ```bash
-hermes --profile work plugins install 'https://github.com/anpicasso/hermes-cursor-provider.git#provider' --enable
+hermes --profile work plugins install cursor-provider
 hermes --profile work auth add cursor
 ```
 
@@ -90,7 +90,7 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 - The plugin does not request Cursor's optional local sandbox because the SDK rejects it on unsupported hosts. Security does not depend on that sandbox: Cursor built-in tools, custom tools, and MCP servers remain disabled, and Hermes owns tool execution.
 - Text streams incrementally from the SDK to Hermes, including managed Relay and async auxiliary consumers. Incomplete tool-call blocks, trailing whitespace, and a possible short action-only announcement are held back. Required/named tool-choice responses and corrective attempts are held until a validated call arrives; ordinary text still streams incrementally. Usage and the finish marker arrive when the SDK run ends. A terminal-only SDK response cannot provide earlier text.
 - A short, unconditional action announcement with no validated call triggers at most two corrective nudges, as does an unsatisfied required/named tool choice when tools are available. Failed preliminary text is not returned as a completed answer or saved in Hermes session history. Exhaustion raises `CursorSDKRunError`; the adapter never infers or executes a tool. Questions, conditional offers, ordinary answers, and requests without enabled tools are not retried. See `docs/recovery-tdd.md` for offline verification and scope.
-- Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop.
+- Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop. Offered Hermes calls emitted on the native channel are intercepted and returned to Hermes; Cursor-native execution remains disabled.
 - Up to 16 idle conversation agents are retained per process by default (`HERMES_CURSOR_MAX_SESSIONS` changes the LRU target); active turns can temporarily exceed it. A history rewrite/compaction starts a fresh agent; concurrent turns on one conversation use an isolated one-shot agent.
 - Agent reuse ends on process restart. Cross-process SDK resume is deliberately not enabled yet.
 - Cursor cache reads and writes are reported through Hermes usage metadata; Cursor's billed `Agent.get_usage()` endpoint may remain unavailable for some accounts.

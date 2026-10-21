@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - Handles the SDK's native `tool_call` events. When the model calls an offered Hermes tool through Cursor's native channel (which the runtime answers with "Tool not found"), the call is converted into a Hermes tool call and the run is cancelled. Disable with `HERMES_CURSOR_INTERCEPT_NATIVE=0`.
 - Matches model-written tool names against offered tools (prefixes like `functions.`/`mcp_`, CamelCase, unique multi-word suffix) and unwraps Cursor's `CallMcpTool` wrapper.
