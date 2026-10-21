@@ -137,7 +137,35 @@ def main() -> None:
             agent, [{"role": "user", "content": "hello"}], []
         )
         assert request.get("_cursor_session_scope")
+        variant_model = "grok-4.7@reasoning_effort=xhigh,fast=true"
+        setattr(agent, "model", variant_model)
+        variant_request = build_api_kwargs(
+            agent, [{"role": "user", "content": "hello"}], []
+        )
+        assert variant_request["model"] == variant_model
+        assert variant_request.get("_cursor_session_scope")
+        assert profile.build_api_kwargs_extras(
+            reasoning_config={"effort": "xhigh"}, session_id="offline-session"
+        ) == ({}, {"_cursor_session_scope": "offline-session"})
+        assert profile.get_model_context_length("grok-4.7@context=500k") == 500_000
+        assert profile.get_model_context_length("grok-4.7") is None
         agent.close()
+
+        original_fetch_models = profile.fetch_models
+        listed_variant = "grok-4.7@fast=true,reasoning_effort=xhigh"
+        profile.fetch_models = lambda **_: ["auto", listed_variant]
+        try:
+            from hermes_cli.models_validate import validate_requested_model
+
+            verdict = validate_requested_model(
+                listed_variant,
+                "cursor",
+                api_key="offline-probe-token",
+                base_url=runtime["base_url"],
+            )
+        finally:
+            profile.fetch_models = original_fetch_models
+        assert verdict["accepted"] and verdict["recognized"], verdict
 
         client = profile.create_client(api_key=runtime["api_key"], base_url=runtime["base_url"])
         assert client is not None

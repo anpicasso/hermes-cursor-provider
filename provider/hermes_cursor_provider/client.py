@@ -486,15 +486,130 @@ class _ToolBlockStream:
         return part
 
 
-def _model_id(model: str | None) -> str | None:
+def _split_model(model: str | None) -> tuple[str, list[dict[str, str]]]:
+    """Split ``id@key=value,...`` into a Cursor model id and parameter list.
+
+    Parameter ids/values are the ones Cursor's ``list_models()`` reports
+    (e.g. ``reasoning_effort=xhigh,fast=true,context=500k``). Malformed
+    suffixes fail instead of silently selecting the default variant."""
     value = str(model or "").strip()
     for prefix in ("cursor/", "cursor:"):
         if value.lower().startswith(prefix):
             value = value[len(prefix):]
             break
+    base, sep, suffix = value.partition("@")
+    base = base.strip()
+    params: list[dict[str, str]] = []
+    if sep:
+        if not base:
+            raise ValueError(f"Cursor model parameters need a model id: {value!r}")
+        if "@" in suffix:
+            raise ValueError(f"Cursor model parameters contain more than one '@': {value!r}")
+        seen: set[str] = set()
+        for item in suffix.split(","):
+            key, eq, val = (part.strip() for part in item.partition("="))
+            if not eq or not key or not val:
+                raise ValueError(
+                    f"Cursor model parameters must be key=value pairs: {value!r}"
+                )
+            if key in seen:
+                raise ValueError(f"Cursor model parameters repeat {key!r}: {value!r}")
+            seen.add(key)
+            params.append({"id": key, "value": val})
     # Cursor requires an explicit model for local agents. ``auto`` is the
     # documented server-selected fallback; ``default`` is only our alias.
-    return "auto" if value.lower() in {"", "auto", "default"} else value
+    if base.lower() in {"", "auto", "default"}:
+        base = "auto"
+    return base, params
+
+
+def _model_id(model: str | None) -> str:
+    """Normalised model name, including any parameters (used as a session key)."""
+    base, params = _split_model(model)
+    if not params:
+        return base
+    # Sort by id so `a=1,b=2` and `b=2,a=1` share one retained session.
+    ordered = sorted(params, key=lambda param: param["id"])
+    return base + "@" + ",".join(f"{p['id']}={p['value']}" for p in ordered)
+
+
+def _model_selection(model: str | None) -> str | dict[str, Any]:
+    """Value for the SDK's ``model`` option: a bare id or ``{id, params}``."""
+    base, params = _split_model(model)
+    return {"id": base, "params": params} if params else base
+
+
+def _model_parameter_values(models: Iterable[Any]) -> dict[str, dict[str, set[str]]]:
+    """Model id -> parameter id -> accepted values from ``list_models()``."""
+    catalog: dict[str, dict[str, set[str]]] = {}
+    for model in models:
+        model_id = str(getattr(model, "id", "") or "").strip()
+        if not model_id:
+            continue
+        allowed: dict[str, set[str]] = {}
+        for definition in getattr(model, "parameters", ()) or ():
+            parameter_id = str(getattr(definition, "id", "") or "").strip()
+            if not parameter_id:
+                continue
+            for item in getattr(definition, "values", ()) or ():
+                value = str(getattr(item, "value", "") or "").strip()
+                if value:
+                    allowed.setdefault(parameter_id, set()).add(value)
+        for variant in getattr(model, "variants", ()) or ():
+            for item in getattr(variant, "params", ()) or ():
+                parameter_id = str(getattr(item, "id", "") or "").strip()
+                value = str(getattr(item, "value", "") or "").strip()
+                if parameter_id and value:
+                    allowed.setdefault(parameter_id, set()).add(value)
+        catalog[model_id] = allowed
+    return catalog
+
+
+def _parameter_error(
+    model_id: str, params: list[dict[str, str]], catalog: dict[str, dict[str, set[str]]]
+) -> str | None:
+    """Why *params* is unsupported for *model_id*, or None when it is valid."""
+    allowed = catalog.get(model_id)
+    if allowed is None:
+        return f"Cursor model {model_id!r} is not in this account's model list"
+    for param in params:
+        values = allowed.get(param["id"])
+        if values is None:
+            supported = ", ".join(sorted(allowed)) or "none"
+            return (
+                f"Cursor model {model_id!r} has no parameter {param['id']!r} "
+                f"(supported: {supported})"
+            )
+        if param["value"] not in values:
+            choices = ", ".join(sorted(values)) or "none"
+            return (
+                f"Cursor model {model_id!r} parameter {param['id']!r} must be one of "
+                f"{choices}; got {param['value']!r}"
+            )
+    return None
+
+
+def _context_window(model: str | None) -> int | None:
+    """Token window from a ``context=500k`` parameter, for Hermes' compression budget."""
+    try:
+        _, params = _split_model(model)
+    except ValueError:
+        return None
+    for param in params:
+        if param["id"] != "context":
+            continue
+        value = param["value"].strip().lower()
+        multiplier = 1
+        if value.endswith("k"):
+            multiplier, value = 1_000, value[:-1]
+        elif value.endswith("m"):
+            multiplier, value = 1_000_000, value[:-1]
+        try:
+            tokens = int(float(value) * multiplier)
+        except (ValueError, OverflowError):
+            return None
+        return tokens if tokens > 0 else None
+    return None
 
 
 def _assistant_history(content: str, calls: list[Any]) -> dict[str, Any]:
@@ -818,7 +933,14 @@ class CursorSDKClient:
             "mcp_servers": {},
             "tools": [],
         }
-        selected_model = _model_id(model)
+        selected_model = _model_selection(model)
+        if isinstance(selected_model, dict):
+            catalog = _model_parameter_values(client.list_models(api_key=self.api_key))
+            error = _parameter_error(
+                selected_model["id"], selected_model["params"], catalog
+            )
+            if error:
+                raise ValueError(error)
         if selected_model:
             options["model"] = selected_model
         return client.create_agent(options)
@@ -1014,6 +1136,7 @@ class CursorSDKClient:
         Returns (result, calls, content). Non-stream callers drain it; stream callers
         convert the events into OpenAI chunks before the SDK run completes."""
         self._validate_request()
+        _split_model(model)  # reject malformed model parameters before launching the bridge
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)
@@ -1041,7 +1164,7 @@ class CursorSDKClient:
             )
 
         account = hashlib.blake2b(self.api_key.encode(), digest_size=16).hexdigest()
-        key = (home, session_scope, account, str(_model_id(model)))
+        key = (home, session_scope, account, _model_id(model))
         session = _lease_session(key)
         if session is None:
             # ponytail: concurrent turns bypass shared state instead of queueing or corrupting it.
@@ -1264,6 +1387,42 @@ def list_cursor_models(*, api_key: str, timeout: float = 8.0) -> list[str]:
             allow_api_key_env_fallback=False,
         )
         try:
-            return [str(model.id).strip() for model in client.list_models(api_key=api_key) if str(model.id).strip()]
+            catalog = list(client.list_models(api_key=api_key))
+            models = [
+                str(model.id).strip() for model in catalog if str(model.id).strip()
+            ]
         finally:
             client.close()
+    return models + _configured_variants(models, catalog)
+
+
+def _configured_variants(models: list[str], catalog: Iterable[Any]) -> list[str]:
+    """Opt-in parameter variants to list alongside the base models.
+
+    ``HERMES_CURSOR_MODEL_VARIANTS`` is a ``;``-separated list such as
+    ``grok-4.7@context=500k,reasoning_effort=xhigh,fast=true``. Listing them lets
+    Hermes' model validation (e.g. ``/model``) accept the parameterised name.
+    Malformed entries, bare ids, variants of models the account cannot see, and
+    unsupported parameter ids/values are skipped.
+    """
+    raw = os.environ.get("HERMES_CURSOR_MODEL_VARIANTS", "")
+    known = set(models)
+    allowed = _model_parameter_values(catalog)
+    out: list[str] = []
+    for entry in raw.split(";"):
+        if not entry.strip():
+            continue
+        try:
+            base, params = _split_model(entry)
+        except ValueError:
+            continue
+        name = _model_id(entry)
+        if (
+            params
+            and base in known
+            and name
+            and name not in out
+            and _parameter_error(base, params, allowed) is None
+        ):
+            out.append(name)
+    return out

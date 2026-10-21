@@ -7,7 +7,7 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
-from .hermes_cursor_provider.client import CURSOR_API_URL
+from .hermes_cursor_provider.client import CURSOR_API_URL, _context_window
 
 _log = logging.getLogger(__name__)
 _SEED_MODELS = ("auto", "composer-2.5")
@@ -18,6 +18,13 @@ class CursorProfile(ProviderProfile):
         from .hermes_cursor_provider.client import CursorSDKClient
 
         return CursorSDKClient(**kwargs)
+
+    def get_model_context_length(self, model: str) -> int | None:
+        # Explicit `context=...` parameter beats the host's generic family default.
+        try:
+            return _context_window(model)
+        except Exception:
+            return None
 
     def fetch_models(
         self,
