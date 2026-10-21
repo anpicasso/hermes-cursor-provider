@@ -29,6 +29,8 @@ _MAX_IMAGE_BASE64_CHARS = 28_000_000
 _LOG = logging.getLogger("hermes_cursor_provider")
 _FALSEY = {"0", "false", "no", "off", ""}
 _SECRET_KEY_RE = re.compile(r"(pass|secret|token|key|auth|cookie|credential|^text$|^value$|^values$|^fields$|^input$)", re.I)
+# Raw payload fields are never logged, even if a caller passes them by mistake.
+_DEBUG_RAW_FIELDS = {"args", "arguments", "result", "block"}
 # Cursor-native MCP wrapper tool names; their args carry the real tool name.
 _NATIVE_WRAPPERS = {"callmcptool", "call_mcp_tool", "mcp", "use_mcp_tool"}
 
@@ -59,14 +61,23 @@ def _mask(value: Any, depth: int = 0) -> Any:
 def _debug_event(kind: str, **fields: Any) -> None:
     """Append one JSON line to <HERMES_HOME>/logs/cursor-provider-events.jsonl.
 
-    Off unless HERMES_CURSOR_DEBUG_EVENTS=1. Values are truncated and secret-masked."""
+    Off unless HERMES_CURSOR_DEBUG_EVENTS=1. Callers pass bounded metadata only
+    (names, statuses, ids, argument keys); raw arguments, results, and blocks are
+    never logged. Values are truncated and secret-masked as a second line of defense."""
     if not _flag("HERMES_CURSOR_DEBUG_EVENTS", False):
         return
     try:
         path = Path(_home_key()) / "logs" / "cursor-provider-events.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        record = {"ts": round(time.time(), 3), "kind": kind, **{k: _mask(v) for k, v in fields.items()}}
-        with open(path, "a", encoding="utf-8") as handle:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        record = {
+            "ts": round(time.time(), 3),
+            "kind": kind,
+            **{k: _mask(v) for k, v in fields.items() if k not in _DEBUG_RAW_FIELDS},
+        }
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            with suppress(OSError):
+                os.chmod(path, 0o600)  # tighten logs created by older versions
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception:  # logging must never break a turn
         pass
@@ -534,14 +545,12 @@ class _ToolBlockStream:
             if not found:
                 self.rejected += 1
                 _LOG.warning("cursor provider: rejected an unusable <tool_call> block (%d chars)", len(block))
-                _debug_event("rejected_tool_block", block=block)
+                _debug_event("rejected_tool_block", chars=len(block))
                 yield ("text", self._record(block))
             else:
                 for call in found:
-                    if not self._accept(call):
-                        continue
-                    self.calls.append(call)
-                    yield ("call", call)
+                    if self._accept(call):
+                        yield ("call", call)
 
     def _accept(self, call: Any) -> bool:
         # A model sometimes repeats the exact same call many times in one reply; executing every
@@ -564,6 +573,7 @@ class _ToolBlockStream:
                 n += 1
             call.id = call.call_id = f"{base}_{n}"
         self._seen_ids.add(call.id)
+        self.calls.append(call)
         return True
 
     def _block_end(self) -> int:
@@ -587,6 +597,10 @@ class _ToolBlockStream:
     def flush(self) -> Iterable[tuple[str, Any]]:
         if self._buffer:
             tail, self._buffer = self._buffer, ""
+            # The buffer is being dropped, so its delimiter scan state is stale. The parser is
+            # reused for a corrective retry; a fresh block must start scanning from the opener.
+            self._scan = len(self._OPEN)
+            self._quoted = self._escaped = False
             yield ("text", self._record(tail))
 
     def _record(self, part: str) -> str:
@@ -991,10 +1005,14 @@ class CursorSDKClient:
         streamed = ""
         failure = ""
         stopped = False
+        stopping = False
         stream = getattr(run, "stream", None)
         if callable(stream):
             for event in cast(Iterable[Any], stream()):
                 kind = str(getattr(event, "type", ""))
+                if stopping and kind != "tool_call":
+                    # The intercepted batch is complete; cancel before nested work or text runs.
+                    break
                 if kind == "assistant":
                     if native["intercepted"]:
                         stopped = True  # model moved on after a native call; Hermes owns the loop
@@ -1016,7 +1034,8 @@ class CursorSDKClient:
                     call_id = str(getattr(event, "call_id", "") or "")
                     _debug_event(
                         "tool_call", name=name, status=status, call_id=call_id,
-                        args=args, result=getattr(event, "result", None),
+                        arg_keys=sorted(str(key) for key in args) if isinstance(args, dict) else [],
+                        has_result=getattr(event, "result", None) is not None,
                     )
                     finished = status in {"completed", "error"}
                     if not intercept:
@@ -1034,19 +1053,17 @@ class CursorSDKClient:
                     call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
                     if call is not None:
                         native["ids"].add(call_id or call.id)
-                        native["intercepted"].append(call)
-                        parser.calls.append(call)
-                        _LOG.warning(
-                            "cursor provider: intercepted native tool call %r -> Hermes tool %r",
-                            name, call.function.name,
-                        )
-                        yield ("call", call)
+                        if parser._accept(call):
+                            native["intercepted"].append(call)
+                            stopping = True
+                            _LOG.warning(
+                                "cursor provider: intercepted native tool call %r -> Hermes tool %r",
+                                name, call.function.name,
+                            )
+                            yield ("call", call)
                     elif allowed_names and name:
                         native["misses"].append(str(name))
                         _LOG.warning("cursor provider: model called unknown native tool %r", name)
-                    if native["intercepted"] and not native["pending"]:
-                        stopped = True
-                        break
         else:
             iter_text = getattr(run, "iter_text", None)
             if callable(iter_text):
@@ -1055,12 +1072,6 @@ class CursorSDKClient:
                     if text:
                         streamed += text
                         yield from parser.feed(text)
-        if stopped:
-            with suppress(Exception):
-                run.cancel()
-            result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
-            return result, streamed, "", True
-        result = run.wait()
         if intercept:
             for call_id, (name, args) in list(native["pending"].items()):
                 if call_id in native["ids"]:
@@ -1068,11 +1079,20 @@ class CursorSDKClient:
                 call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
                 if call is not None:
                     native["ids"].add(call_id)
-                    native["intercepted"].append(call)
-                    parser.calls.append(call)
-                    _LOG.warning("cursor provider: intercepted unfinished native tool call %r at run end", name)
-                    yield ("call", call)
+                    if parser._accept(call):
+                        native["intercepted"].append(call)
+                        _LOG.warning("cursor provider: intercepted unfinished native tool call %r at run end", name)
+                        yield ("call", call)
             native["pending"].clear()
+        if stopping:
+            # A terminal native call was accepted; the run is cancelled rather than waited on.
+            stopped = True
+        if stopped:
+            with suppress(Exception):
+                run.cancel()
+            result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
+            return result, streamed, "", True
+        result = run.wait()
         return result, streamed, failure, False
 
     def _run_agent(
