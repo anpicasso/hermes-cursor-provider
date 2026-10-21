@@ -1,6 +1,7 @@
 """Official Cursor SDK model-provider plugin for Hermes Agent."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from providers import register_provider
@@ -8,6 +9,7 @@ from providers.base import ProviderProfile
 
 from .hermes_cursor_provider.client import CURSOR_API_URL
 
+_log = logging.getLogger(__name__)
 _SEED_MODELS = ("auto", "composer-2.5")
 
 
@@ -31,7 +33,11 @@ class CursorProfile(ProviderProfile):
             from .hermes_cursor_provider.client import list_cursor_models
 
             models = list_cursor_models(api_key=api_key or "", timeout=timeout)
-        except Exception:
+        except Exception as exc:
+            _log.warning(
+                "Cursor model listing failed (%s: %s); showing seed models only",
+                type(exc).__name__, exc,
+            )
             return None
         return models or None
 
