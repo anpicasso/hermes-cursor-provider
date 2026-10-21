@@ -4,6 +4,7 @@ import json
 import asyncio
 import base64
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import threading
 import time
@@ -360,6 +361,17 @@ def test_model_listing_uses_sdk_and_closes_bridge():
     assert sdk.list_api_key == "crsr_test"
     assert sdk.closed
     assert FakeCursorClient.launches[0]["allow_api_key_env_fallback"] is False
+
+
+def test_model_listing_without_sdk_logs_warning_and_returns_empty(monkeypatch, caplog):
+    def missing_sdk(name):
+        raise ImportError("No module named 'cursor_sdk'")
+
+    monkeypatch.setattr(client_module, "importlib", SimpleNamespace(import_module=missing_sdk))
+    with caplog.at_level(logging.WARNING, logger=client_module.__name__):
+        assert list_cursor_models(api_key="crsr_test", timeout=4) == []
+    assert "cursor-sdk" in caplog.text
+    assert "not importable" in caplog.text
 
 
 def test_missing_key_and_foreign_base_url_fail_before_launch():

@@ -1466,6 +1466,10 @@ def list_cursor_models(*, api_key: str, timeout: float = 8.0) -> list[str]:
     try:
         CursorClient = importlib.import_module("cursor_sdk").CursorClient
     except ImportError:
+        logging.getLogger(__name__).warning(
+            "Cursor model listing skipped: the 'cursor-sdk' package is not importable by this "
+            "Python environment. Install 'cursor-sdk>=1.0.32,<2' into the environment Hermes runs with."
+        )
         return []
     with tempfile.TemporaryDirectory(prefix="hermes-cursor-models-") as workspace:
         client = CursorClient.launch_bridge(

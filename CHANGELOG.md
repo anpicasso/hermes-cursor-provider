@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (fork: native tool-call interception)
+## Unreleased
 
 - Handles the SDK's native `tool_call` events. When the model calls an offered Hermes tool through Cursor's native channel (which the runtime answers with "Tool not found"), the call is converted into a Hermes tool call and the run is cancelled. Disable with `HERMES_CURSOR_INTERCEPT_NATIVE=0`.
 - Matches model-written tool names against offered tools (prefixes like `functions.`/`mcp_`, CamelCase, unique multi-word suffix) and unwraps Cursor's `CallMcpTool` wrapper.
@@ -11,6 +11,8 @@
 - Native calls are only converted on a final (completed or error) event, using that event's arguments (pending args from earlier running events are the fallback); calls still unfinished when the run ends are converted then.
 - Diagnostics: warnings through the `hermes_cursor_provider` logger; bounded event metadata only (never raw arguments, results, or rejected blocks) to `<HERMES_HOME>/logs/cursor-provider-events.jsonl` when `HERMES_CURSOR_DEBUG_EVENTS=1`. Log files use owner-only permissions. Adds `scripts/native_tool_probe.py`.
 - Resets incomplete-block parser state before corrective retries, deduplicates native calls through the shared acceptance path, and forwards contiguous terminal-event siblings before cancelling the intercepted run.
+- Logs a warning when the model list cannot be loaded (for example, `cursor-sdk` is not installed in Hermes' Python environment) instead of silently showing only the seed models.
+- README: troubleshooting for a model picker that shows only `auto` and `composer-2.5`.
 
 ## 0.3.6
 
