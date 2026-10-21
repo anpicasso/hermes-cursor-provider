@@ -101,10 +101,40 @@ class FakeAgent:
         self.closed = True
 
 
+def _parameter(parameter_id, *values):
+    return SimpleNamespace(
+        id=parameter_id,
+        values=[SimpleNamespace(value=value) for value in values],
+    )
+
+
 class FakeCursorClient:
     launches = []
     instances = []
-    models = [SimpleNamespace(id="composer-2.5"), SimpleNamespace(id="gpt-5.4")]
+    models = [
+        SimpleNamespace(
+            id="composer-2.5",
+            parameters=[_parameter("fast", "true", "false")],
+            variants=[],
+        ),
+        SimpleNamespace(
+            id="gpt-5.4",
+            parameters=[
+                _parameter("reasoning_effort", "low", "high"),
+                _parameter("fast", "true", "false"),
+            ],
+            variants=[],
+        ),
+        SimpleNamespace(
+            id="grok-4.7",
+            parameters=[
+                _parameter("context", "256k", "500k"),
+                _parameter("reasoning_effort", "low", "medium", "high", "xhigh"),
+                _parameter("fast", "true", "false"),
+            ],
+            variants=[],
+        ),
+    ]
 
     def __init__(self):
         self.options = []
@@ -355,7 +385,9 @@ def test_async_completion_and_stream():
 
 
 def test_model_listing_uses_sdk_and_closes_bridge():
-    assert list_cursor_models(api_key="crsr_test", timeout=4) == ["composer-2.5", "gpt-5.4"]
+    assert list_cursor_models(api_key="crsr_test", timeout=4) == [
+        "composer-2.5", "gpt-5.4", "grok-4.7",
+    ]
     sdk = FakeCursorClient.instances[0]
     assert sdk.list_api_key == "crsr_test"
     assert sdk.closed
@@ -1113,3 +1145,242 @@ def test_lazy_stream_preserves_provider_error_and_client_cancellation():
     asyncio.run(scenario())
     assert run.cancelled and not client._runs
     assert agent.closed
+
+
+# --- model parameter selection (model@key=value,...) ---
+
+from hermes_cursor_provider.client import _context_window, _model_id, _model_selection
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        (None, "auto"),
+        ("", "auto"),
+        ("default", "auto"),
+        ("grok-4.7", "grok-4.7"),
+        ("cursor/grok-4.7", "grok-4.7"),
+        (
+            "grok-4.7@reasoning_effort=xhigh,fast=true",
+            {"id": "grok-4.7", "params": [
+                {"id": "reasoning_effort", "value": "xhigh"},
+                {"id": "fast", "value": "true"},
+            ]},
+        ),
+        (
+            "cursor:claude-opus-5-5@ context=1m , effort=max ",
+            {"id": "claude-opus-5-5", "params": [
+                {"id": "context", "value": "1m"},
+                {"id": "effort", "value": "max"},
+            ]},
+        ),
+    ],
+)
+def test_model_selection_parses_params(name, expected):
+    assert _model_selection(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["grok-4.7@", "grok-4.7@xhigh", "grok-4.7@=x", "grok-4.7@fast=", "@fast=true",
+     "grok-4.7@fast=true,fast=false", "grok-4.7@fast=true@extra"],
+)
+def test_model_selection_rejects_malformed_params(name):
+    with pytest.raises(ValueError, match="Cursor model parameters"):
+        _model_selection(name)
+
+
+def test_create_agent_sends_parameterised_selection():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="grok-4.7@reasoning_effort=xhigh,fast=true",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.options[0]["model"] == {"id": "grok-4.7", "params": [
+        {"id": "reasoning_effort", "value": "xhigh"},
+        {"id": "fast", "value": "true"},
+    ]}
+
+
+def test_parameter_selection_reaches_sdk_for_async_and_stream():
+    client = CursorSDKClient(api_key="crsr_test")
+
+    async def scenario():
+        await client.chat.completions.create(
+            model="grok-4.7@fast=true", messages=[]
+        )
+        stream = await client.chat.completions.create(
+            model="grok-4.7@reasoning_effort=xhigh", messages=[], stream=True
+        )
+        return [chunk async for chunk in stream]
+
+    try:
+        chunks = asyncio.run(scenario())
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.options[0]["model"] == {
+        "id": "grok-4.7", "params": [{"id": "fast", "value": "true"}]
+    }
+    assert sdk.options[1]["model"] == {
+        "id": "grok-4.7", "params": [{"id": "reasoning_effort", "value": "xhigh"}]
+    }
+    assert _stream_text(chunks) == "hello"
+
+
+@pytest.mark.parametrize(
+    "model, message",
+    [
+        ("grok-4.7@bogus=true", "has no parameter 'bogus'"),
+        ("grok-4.7@reasoning_effort=ultra", "must be one of"),
+        ("grok-4.7@fast=maybe", "must be one of"),
+        ("unlisted@fast=true", "not in this account's model list"),
+    ],
+)
+def test_unsupported_parameters_fail_closed_before_agent_creation(model, message):
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        with pytest.raises(ValueError, match=message):
+            client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        client.close()
+    assert FakeCursorClient.instances[0].options == []
+    assert FakeCursorClient.instances[0].agents == []
+
+
+def test_parameterized_run_fails_closed_when_catalog_is_unavailable(monkeypatch):
+    def unavailable(_self, *, api_key):
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(FakeCursorClient, "list_models", unavailable)
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        with pytest.raises(RuntimeError, match="catalog unavailable"):
+            client.chat.completions.create(
+                model="grok-4.7@fast=true", messages=[]
+            )
+    finally:
+        client.close()
+    assert FakeCursorClient.instances[0].options == []
+
+
+def test_malformed_params_fail_before_bridge_launch():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        with pytest.raises(ValueError, match="Cursor model parameters"):
+            client.chat.completions.create(
+                model="grok-4.7@xhigh", messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        client.close()
+    assert FakeCursorClient.launches == []
+
+
+def test_sessions_isolate_parameter_variants():
+    for model in ("grok-4.7", "grok-4.7@reasoning_effort=xhigh", "grok-4.7@reasoning_effort=low"):
+        client = CursorSDKClient(api_key="crsr_a")
+        client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": model}],
+            _cursor_session_scope="scope-1",
+        )
+        client.close()
+    assert len(FakeCursorClient.instances[0].agents) == 3
+    assert len(client_module._SESSIONS) == 3
+
+
+def test_parameter_order_does_not_split_the_retained_session():
+    first = CursorSDKClient(api_key="crsr_test")
+    first.chat.completions.create(
+        model="grok-4.7@fast=true,reasoning_effort=xhigh",
+        messages=[{"role": "user", "content": "first-user"}],
+        _cursor_session_scope="scope-order",
+    )
+    first.close()
+
+    second = CursorSDKClient(api_key="crsr_test")
+    second.chat.completions.create(
+        model="grok-4.7@reasoning_effort=xhigh,fast=true",
+        messages=[
+            {"role": "user", "content": "first-user"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "second-user"},
+        ],
+        _cursor_session_scope="scope-order",
+    )
+    second.close()
+
+    sdk = FakeCursorClient.instances[0]
+    assert len(sdk.agents) == 1
+    assert len(sdk.agents[0].messages) == 2
+
+
+def test_model_id_keeps_params_in_normalised_name():
+    assert _model_id("cursor/grok-4.7@ fast=true ") == "grok-4.7@fast=true"
+    assert _model_id(
+        "grok-4.7@fast=true,reasoning_effort=xhigh"
+    ) == _model_id("grok-4.7@reasoning_effort=xhigh,fast=true")
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("grok-4.7@context=500k", 500_000),
+        ("claude-opus-5-5@context=1m,effort=max", 1_000_000),
+        ("grok-4.7@context=200000", 200_000),
+        ("grok-4.7@context=0", None),
+        ("grok-4.7@context=wide", None),
+        ("grok-4.7@context=inf", None),
+        ("grok-4.7@context=1e999", None),
+        ("grok-4.7@fast=true", None),
+        ("grok-4.7", None),
+        ("grok-4.7@broken", None),
+    ],
+)
+def test_context_window_reads_context_parameter(model, expected):
+    assert _context_window(model) == expected
+
+
+# --- opt-in parameter variants in the model listing (HERMES_CURSOR_MODEL_VARIANTS) ---
+
+
+def test_listing_without_variants_env_is_unchanged(monkeypatch):
+    monkeypatch.delenv("HERMES_CURSOR_MODEL_VARIANTS", raising=False)
+    assert list_cursor_models(api_key="crsr_test") == [
+        "composer-2.5", "gpt-5.4", "grok-4.7",
+    ]
+
+
+def test_listing_appends_configured_variants_in_normalised_form(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_CURSOR_MODEL_VARIANTS",
+        " composer-2.5@fast=false ; cursor/gpt-5.4@ reasoning_effort=high , fast=true ;",
+    )
+    assert list_cursor_models(api_key="crsr_test") == [
+        "composer-2.5",
+        "gpt-5.4",
+        "grok-4.7",
+        "composer-2.5@fast=false",
+        "gpt-5.4@fast=true,reasoning_effort=high",
+    ]
+
+
+def test_listing_skips_malformed_unknown_bare_and_duplicate_variants(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_CURSOR_MODEL_VARIANTS",
+        "composer-2.5@xhigh;not-a-model@fast=true;composer-2.5;"
+        "composer-2.5@fast=true;composer-2.5@fast=true;"
+        "grok-4.7@reasoning_effort=ultra;grok-4.7@bogus=true",
+    )
+    assert list_cursor_models(api_key="crsr_test") == [
+        "composer-2.5",
+        "gpt-5.4",
+        "grok-4.7",
+        "composer-2.5@fast=true",
+    ]

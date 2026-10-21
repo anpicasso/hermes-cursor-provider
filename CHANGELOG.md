@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Adds Cursor model parameter selection: `model@key=value,...` (e.g. `grok-4.7@fast=true,reasoning_effort=xhigh`) is sent to the SDK as `{id, params}`. Malformed suffixes fail before the bridge launches; parameter ids and values are checked against the account's `list_models()` catalog before agent creation. Parameter variants get separate retained sessions, independent of parameter order, and `context=` sets Hermes' compression budget. Automatic mapping of Hermes `/reasoning` settings is not included.
+- Adds opt-in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) so chosen parameter variants appear in the model listing and pass Hermes' `/model` validation; unsupported ids/values are skipped.
 - Logs a warning when the model list cannot be loaded (for example, `cursor-sdk` is not installed in Hermes' Python environment) instead of silently showing only the seed models.
 - README: troubleshooting for a model picker that shows only `auto` and `composer-2.5`.
 
