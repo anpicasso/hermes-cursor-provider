@@ -9,9 +9,11 @@ import importlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -23,6 +25,95 @@ from typing import Any, Iterable, cast
 CURSOR_API_URL = "https://api.cursor.com"
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
+
+_LOG = logging.getLogger("hermes_cursor_provider")
+_FALSEY = {"0", "false", "no", "off", ""}
+_SECRET_KEY_RE = re.compile(r"(pass|secret|token|key|auth|cookie|credential|^text$|^value$|^values$|^fields$|^input$)", re.I)
+# Raw payload fields are never logged, even if a caller passes them by mistake.
+_DEBUG_RAW_FIELDS = {"args", "arguments", "result", "block"}
+# Cursor-native MCP wrapper tool names; their args carry the real tool name.
+_NATIVE_WRAPPERS = {"callmcptool", "call_mcp_tool", "mcp", "use_mcp_tool"}
+
+
+def _flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    return default if value is None else value.strip().lower() not in _FALSEY
+
+
+def _mask(value: Any, depth: int = 0) -> Any:
+    """Bounded, secret-masked copy of a value for the debug event log."""
+    if depth > 4:
+        return "…"
+    if isinstance(value, dict):
+        return {
+            str(k): ("***" if _SECRET_KEY_RE.search(str(k)) else _mask(v, depth + 1))
+            for k, v in list(value.items())[:40]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_mask(v, depth + 1) for v in list(value)[:20]]
+    if isinstance(value, str):
+        return value[:300] + ("…" if len(value) > 300 else "")
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return str(value)[:300]
+
+
+def _debug_event(kind: str, **fields: Any) -> None:
+    """Append one JSON line to <HERMES_HOME>/logs/cursor-provider-events.jsonl.
+
+    Off unless HERMES_CURSOR_DEBUG_EVENTS=1. Callers pass bounded metadata only
+    (names, statuses, ids, argument keys); raw arguments, results, and blocks are
+    never logged. Values are truncated and secret-masked as a second line of defense."""
+    if not _flag("HERMES_CURSOR_DEBUG_EVENTS", False):
+        return
+    try:
+        path = Path(_home_key()) / "logs" / "cursor-provider-events.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        record = {
+            "ts": round(time.time(), 3),
+            "kind": kind,
+            **{k: _mask(v) for k, v in fields.items() if k not in _DEBUG_RAW_FIELDS},
+        }
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            with suppress(OSError):
+                os.chmod(path, 0o600)  # tighten logs created by older versions
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # logging must never break a turn
+        pass
+
+
+def _snake(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+
+
+def match_allowed_name(name: Any, allowed: set[str]) -> str | None:
+    """Map a model-written tool name onto an offered Hermes tool name, or None.
+
+    Accepts exact names, namespace/prefix forms (functions.x, mcp__srv__x, mcp_x),
+    CamelCase, and a unique ``*_name`` suffix match for multi-word names."""
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    if raw in allowed:
+        return raw
+    cands = [raw]
+    for sep in (".", "/", ":", "__"):
+        if sep in raw:
+            cands.append(raw.split(sep)[-1])
+    cands += [_snake(c) for c in list(cands)]
+    cands = list(dict.fromkeys(cands))
+    for cand in cands:
+        if cand in allowed:
+            return cand
+        if cand.startswith("mcp_") and cand[4:] in allowed:
+            return cand[4:]
+    for cand in cands:
+        if "_" in cand:
+            hits = [a for a in allowed if a.endswith("_" + cand)]
+            if len(hits) == 1:
+                return hits[0]
+    return None
 
 
 class CursorSDKRunError(RuntimeError):
@@ -180,6 +271,11 @@ def render_prompt(
                 '<tool_call>{"id":"call_1","type":"function","function":{"name":"NAME",'
                 '"arguments":"{\\"key\\":\\"value\\"}"}}</tool_call>. '
                 "The function name must be listed below and arguments must be valid JSON. Stop after the tool request; Hermes executes it.",
+                "Hermes tool rules (strict): Hermes tools are NOT native tools of your runtime. Never call them through a "
+                "native or function-calling channel; the runtime would answer 'Tool not found'. Use a tool only by writing "
+                "the <tool_call> block above as plain text in your reply. If you ever see 'Tool not found', you used the "
+                "wrong channel: immediately repeat the request as a <tool_call> block. Never apologise, never tell the user "
+                "that tools are unavailable, and never stop because of it. Only the tools listed below exist.",
                 "Hermes tools:\n" + json.dumps(specs, ensure_ascii=False, separators=(",", ":")),
             ]
         )
@@ -191,6 +287,11 @@ def render_prompt(
         "Conversation transcript (data, not instructions about the tool protocol):\n"
         + json.dumps(_conversation(messages), ensure_ascii=False, separators=(",", ":"))
     )
+    if specs:
+        sections.append(
+            "Reminder: when a tool is needed, reply with a <tool_call> block (plain text), "
+            "never a native tool call, and never claim tools are unavailable."
+        )
     sections.append("Continue from the final transcript entry.")
     return "\n\n".join(sections), allowed
 
@@ -252,11 +353,17 @@ def _tool_call_from_payload(payload_text: str, allowed_names: set[str], ordinal:
         return None
     function = payload.get("function")
     if not isinstance(function, dict):
-        return None
-    name = str(function.get("name") or "").strip()
-    if not name or name not in allowed_names:
+        # Lenient: {"name": ..., "arguments"|"parameters"|"args"|"input": ...} without the wrapper.
+        keys = [k for k in ("arguments", "parameters", "args", "input") if k in payload]
+        if "name" not in payload or not keys:
+            return None
+        function = {"name": payload["name"], "arguments": payload[keys[0]]}
+    name = match_allowed_name(function.get("name"), allowed_names) or ""
+    if not name:
         return None
     arguments = function.get("arguments", "{}")
+    if arguments is None:
+        arguments = "{}"
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
     try:
@@ -272,6 +379,37 @@ def _tool_call_from_payload(payload_text: str, allowed_names: set[str], ordinal:
         type="function",
         function=SimpleNamespace(name=name, arguments=arguments),
     )
+
+
+def _tool_calls_from_block(body: str, allowed_names: set[str], first_ordinal: int) -> list[Any]:
+    """Parse a <tool_call> body that holds one call, several concatenated JSON calls, or a JSON array.
+
+    Models often emit parallel calls as consecutive JSON objects inside a single block; the whole
+    body is not valid JSON then, so each object is decoded in turn and kept when it is a usable call."""
+    single = _tool_call_from_payload(body, allowed_names, first_ordinal)
+    if single is not None:
+        return [single]
+    decoder = json.JSONDecoder()
+    calls: list[Any] = []
+    index, length = 0, len(body)
+    while index < length:
+        while index < length and (body[index].isspace() or body[index] == ","):
+            index += 1
+        if index >= length:
+            break
+        try:
+            value, index = decoder.raw_decode(body, index)
+        except json.JSONDecodeError:
+            break
+        for item in value if isinstance(value, list) else [value]:
+            if not isinstance(item, dict):
+                continue
+            call = _tool_call_from_payload(
+                json.dumps(item, ensure_ascii=False), allowed_names, first_ordinal + len(calls)
+            )
+            if call is not None:
+                calls.append(call)
+    return calls
 
 
 def extract_tool_calls(text: str, allowed_names: set[str]) -> tuple[list[Any], str]:
@@ -363,6 +501,10 @@ class _ToolBlockStream:
         self._buffer = ""
         self._text: list[str] = []
         self.calls: list[Any] = []
+        self.rejected = 0
+        self.duplicates = 0
+        self._seen_calls: set[tuple[str, str]] = set()
+        self._seen_ids: set[str] = set()
         self._scan = len(self._OPEN)
         self._quoted = self._escaped = False
 
@@ -395,16 +537,44 @@ class _ToolBlockStream:
             )
             self._scan = len(self._OPEN)
             self._quoted = self._escaped = False
-            call = _tool_call_from_payload(
+            found = _tool_calls_from_block(
                 block[len(self._OPEN): -len(self._CLOSE)].strip(),
                 self._allowed,
                 len(self.calls) + 1,
             )
-            if call is None:
+            if not found:
+                self.rejected += 1
+                _LOG.warning("cursor provider: rejected an unusable <tool_call> block (%d chars)", len(block))
+                _debug_event("rejected_tool_block", chars=len(block))
                 yield ("text", self._record(block))
             else:
-                self.calls.append(call)
-                yield ("call", call)
+                for call in found:
+                    if self._accept(call):
+                        yield ("call", call)
+
+    def _accept(self, call: Any) -> bool:
+        # A model sometimes repeats the exact same call many times in one reply; executing every
+        # copy repeats side effects (e.g. 20x kanban_request_review), so keep only the first.
+        try:
+            canonical = json.dumps(json.loads(call.function.arguments), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            canonical = str(call.function.arguments)
+        key = (call.function.name, canonical)
+        if key in self._seen_calls:
+            self.duplicates += 1
+            _LOG.warning("cursor provider: dropped a duplicate %s call in the same reply", call.function.name)
+            _debug_event("duplicate_tool_call", name=call.function.name)
+            return False
+        self._seen_calls.add(key)
+        # Call ids must be unique within a reply so each result pairs with the right call.
+        if call.id in self._seen_ids:
+            base, n = call.id, 2
+            while f"{base}_{n}" in self._seen_ids:
+                n += 1
+            call.id = call.call_id = f"{base}_{n}"
+        self._seen_ids.add(call.id)
+        self.calls.append(call)
+        return True
 
     def _block_end(self) -> int:
         # Delimiters inside JSON strings are tool arguments, not protocol boundaries.
@@ -427,12 +597,63 @@ class _ToolBlockStream:
     def flush(self) -> Iterable[tuple[str, Any]]:
         if self._buffer:
             tail, self._buffer = self._buffer, ""
+            # The buffer is being dropped, so its delimiter scan state is stale. The parser is
+            # reused for a corrective retry; a fresh block must start scanning from the opener.
+            self._scan = len(self._OPEN)
+            self._quoted = self._escaped = False
             yield ("text", self._record(tail))
 
     def _record(self, part: str) -> str:
         if part:
             self._text.append(part)
         return part
+
+
+def _native_tool_call(name: Any, args: Any, call_id: str, allowed: set[str], ordinal: int) -> Any | None:
+    """Turn a Cursor-native tool_call event into a Hermes tool call when it names an offered tool."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return None
+    if args is None:
+        args = {}
+    args = _plain(args)
+    if not isinstance(args, dict):
+        return None
+    tool_name = str(name or "")
+    if tool_name.replace("-", "_").lower() in _NATIVE_WRAPPERS:
+        inner = args.get("toolName") or args.get("tool_name") or args.get("name")
+        inner_args = args.get("arguments") or args.get("args") or {}
+        if isinstance(inner_args, str):
+            try:
+                inner_args = json.loads(inner_args)
+            except json.JSONDecodeError:
+                return None
+        if not inner or not isinstance(inner_args, dict):
+            return None
+        tool_name, args = str(inner), inner_args
+    payload = {
+        "id": call_id or f"cursor_native_{ordinal}",
+        "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))},
+    }
+    return _tool_call_from_payload(json.dumps(payload), allowed, ordinal)
+
+
+def render_correction(allowed: set[str], misses: list[str], rejected: int) -> str:
+    parts = ["Your last reply did not produce a valid Hermes tool call."]
+    if misses:
+        parts.append(
+            "These native tool names do not exist in this runtime: " + ", ".join(sorted(set(misses))[:10]) + "."
+        )
+    if rejected:
+        parts.append("A <tool_call> block was malformed or named an unknown tool.")
+    parts.append(
+        "Hermes tools are used ONLY by writing a <tool_call>{\"id\":\"call_1\",\"type\":\"function\",\"function\":"
+        "{\"name\":\"NAME\",\"arguments\":\"{...}\"}}</tool_call> block as plain text. Redo the previous request now "
+        "with a correct block. Allowed tool names: " + ", ".join(sorted(allowed)[:80]) + "."
+    )
+    return " ".join(parts)
 
 
 def _split_model(model: str | None) -> tuple[str, list[dict[str, str]]]:
@@ -894,6 +1115,108 @@ class CursorSDKClient:
             options["model"] = selected_model
         return client.create_agent(options)
 
+    def _consume(
+        self,
+        run: Any,
+        parser: "_ToolBlockStream",
+        allowed_names: set[str],
+        native: dict[str, Any],
+    ) -> Any:
+        """Stream one SDK run into ``parser``; returns (result, streamed, failure, stopped)."""
+        intercept = _flag("HERMES_CURSOR_INTERCEPT_NATIVE", True)
+        streamed = ""
+        failure = ""
+        stopped = False
+        stopping = False
+        stream = getattr(run, "stream", None)
+        if callable(stream):
+            for event in cast(Iterable[Any], stream()):
+                kind = str(getattr(event, "type", ""))
+                if stopping and kind != "tool_call":
+                    # The intercepted batch is complete; cancel before nested work or text runs.
+                    break
+                if kind == "assistant":
+                    if native["intercepted"]:
+                        stopped = True  # model moved on after a native call; Hermes owns the loop
+                        break
+                    payload = getattr(event, "message", None)
+                    for block in getattr(payload, "content", ()) or ():
+                        text = str(getattr(block, "text", "") or "")
+                        if text:
+                            streamed += text
+                            yield from parser.feed(text)
+                elif kind == "status":
+                    status = str(getattr(event, "status", "") or "").upper()
+                    if status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                        failure = str(getattr(event, "message", "") or status)
+                elif kind == "tool_call":
+                    name = getattr(event, "name", "")
+                    status = str(getattr(event, "status", "") or "").lower()
+                    args = getattr(event, "args", None)
+                    call_id = str(getattr(event, "call_id", "") or "")
+                    _debug_event(
+                        "tool_call", name=name, status=status, call_id=call_id,
+                        arg_keys=sorted(str(key) for key in args) if isinstance(args, dict) else [],
+                        has_result=getattr(event, "result", None) is not None,
+                    )
+                    finished = status in {"completed", "error"}
+                    if not intercept:
+                        continue
+                    if not finished:
+                        # Arguments may still be streaming; remember them, act on the final event.
+                        if call_id:
+                            native["pending"][call_id] = (name, args)
+                        continue
+                    if call_id and call_id in native["ids"]:
+                        continue
+                    pending = native["pending"].pop(call_id, None) if call_id else None
+                    if args in (None, {}, "") and pending is not None:
+                        args = pending[1]
+                    call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
+                    if call is not None:
+                        native["ids"].add(call_id or call.id)
+                        if parser._accept(call):
+                            native["intercepted"].append(call)
+                            stopping = True
+                            _LOG.warning(
+                                "cursor provider: intercepted native tool call %r -> Hermes tool %r",
+                                name, call.function.name,
+                            )
+                            yield ("call", call)
+                    elif allowed_names and name:
+                        native["misses"].append(str(name))
+                        _LOG.warning("cursor provider: model called unknown native tool %r", name)
+        else:
+            iter_text = getattr(run, "iter_text", None)
+            if callable(iter_text):
+                for part in cast(Iterable[str], iter_text()):
+                    text = str(part or "")
+                    if text:
+                        streamed += text
+                        yield from parser.feed(text)
+        if intercept:
+            for call_id, (name, args) in list(native["pending"].items()):
+                if call_id in native["ids"]:
+                    continue
+                call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
+                if call is not None:
+                    native["ids"].add(call_id)
+                    if parser._accept(call):
+                        native["intercepted"].append(call)
+                        _LOG.warning("cursor provider: intercepted unfinished native tool call %r at run end", name)
+                        yield ("call", call)
+            native["pending"].clear()
+        if stopping:
+            # A terminal native call was accepted; the run is cancelled rather than waited on.
+            stopped = True
+        if stopped:
+            with suppress(Exception):
+                run.cancel()
+            result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
+            return result, streamed, "", True
+        result = run.wait()
+        return result, streamed, failure, False
+
     def _run_agent(
         self,
         agent: Any,
@@ -902,55 +1225,67 @@ class CursorSDKClient:
         images: list[dict[str, str]],
         allowed_names: set[str],
         control: _StreamControl | None = None,
+        info: dict[str, Any] | None = None,
     ) -> Any:
         """Run one agent turn, yielding ('text'|'call', value) events as they stream.
+
+        Native Cursor tool_call events that name an offered Hermes tool are converted into
+        Hermes calls (HERMES_CURSOR_INTERCEPT_NATIVE, default on). When a turn yields no
+        valid call but shows a native miss or a rejected block, one corrective retry is sent
+        (HERMES_CURSOR_RETRY, default on). ``info`` reports native_misses / intercepted / retried.
 
         Returns (result, calls, content) — the extraction the buffered path used,
         produced incrementally so callers see text before the SDK run completes."""
         parser = _ToolBlockStream(allowed_names)
+        native: dict[str, Any] = {"ids": set(), "pending": {}, "intercepted": [], "misses": []}
+        info = info if info is not None else {}
         run = None
         try:
-            run = agent.send({"text": prompt, "images": images})
-            with self._runs_lock:
-                self._runs.add(run)
-            if control is not None:
-                control.run = run
-                if control.closed or self.is_closed:
-                    raise CursorSDKRunError("Cursor stream cancelled during startup")
-            streamed = ""
-            failure = ""
-            stream = getattr(run, "stream", None)
-            if callable(stream):
-                for event in cast(Iterable[Any], stream()):
-                    kind = str(getattr(event, "type", ""))
-                    if kind == "assistant":
-                        payload = getattr(event, "message", None)
-                        for block in getattr(payload, "content", ()) or ():
-                            text = str(getattr(block, "text", "") or "")
-                            if text:
-                                streamed += text
-                                yield from parser.feed(text)
-                    elif kind == "status":
-                        status = str(getattr(event, "status", "") or "").upper()
-                        if status in {"ERROR", "CANCELLED", "EXPIRED"}:
-                            failure = str(getattr(event, "message", "") or status)
-            else:
-                iter_text = getattr(run, "iter_text", None)
-                if callable(iter_text):
-                    for part in cast(Iterable[str], iter_text()):
-                        text = str(part or "")
-                        if text:
-                            streamed += text
-                            yield from parser.feed(text)
-            result = run.wait()
-            status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
-            status = str(status_value or "").upper()
-            if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
-                raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
-            tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
-            if tail:
-                yield from parser.feed(tail)
-            yield from parser.flush()
+            message: dict[str, Any] = {"text": prompt, "images": images}
+            for attempt in (0, 1):
+                run = agent.send(message)
+                with self._runs_lock:
+                    self._runs.add(run)
+                if control is not None:
+                    control.run = run
+                    if control.closed or self.is_closed:
+                        raise CursorSDKRunError("Cursor stream cancelled during startup")
+                try:
+                    result, streamed, failure, stopped = yield from self._consume(
+                        run, parser, allowed_names, native
+                    )
+                finally:
+                    with self._runs_lock:
+                        self._runs.discard(run)
+                if not stopped:
+                    status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
+                    status = str(status_value or "").upper()
+                    if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                        raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
+                    tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
+                    if tail:
+                        yield from parser.feed(tail)
+                yield from parser.flush()
+                info["native_misses"] = len(native["misses"])
+                info["intercepted"] = len(native["intercepted"])
+                needs_retry = (
+                    attempt == 0
+                    and not parser.calls
+                    and allowed_names
+                    and _flag("HERMES_CURSOR_RETRY", True)
+                    and (native["misses"] or parser.rejected)
+                )
+                if not needs_retry:
+                    return result, parser.calls, parser.text
+                info["retried"] = True
+                _LOG.warning(
+                    "cursor provider: no valid tool call (native misses=%d, rejected blocks=%d); sending one corrective retry",
+                    len(native["misses"]), parser.rejected,
+                )
+                _debug_event("retry", misses=native["misses"], rejected=parser.rejected)
+                message = {"text": render_correction(allowed_names, native["misses"], parser.rejected), "images": []}
+                native["misses"] = []
+                parser.rejected = 0
             return result, parser.calls, parser.text
         except BaseException:
             if run is not None:
@@ -1077,13 +1412,27 @@ class CursorSDKClient:
             prompt, allowed_names = render_prompt(
                 request_messages, tools=tools, tool_choice=tool_choice
             )
+            info: dict[str, Any] = {}
             result, calls, content = yield from self._run_agent(
                 session.agent,
                 prompt=prompt,
                 images=extract_images(request_messages),
                 allowed_names=allowed_names,
                 control=control,
+                info=info,
             )
+            if (
+                not calls
+                and (info.get("native_misses") or info.get("retried"))
+                and _flag("HERMES_CURSOR_RESET_POISONED", True)
+            ):
+                # The retained agent now remembers failed native-tool rounds; start clean next turn.
+                _LOG.warning("cursor provider: resetting retained SDK agent after a failed tool-call turn")
+                with suppress(Exception):
+                    session.agent.close()
+                session.agent = None
+                session.history.clear()
+                return result, calls, content
             session.history = incoming + [_assistant_history(content, calls)]
             return result, calls, content
         except BaseException:

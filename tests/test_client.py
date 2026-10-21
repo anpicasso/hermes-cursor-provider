@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import asyncio
 import base64
 from dataclasses import dataclass
@@ -737,7 +738,8 @@ def test_stream_splits_tool_block_at_arbitrary_boundaries():
         '<tool_call>{"function":{"name":"read_file","arguments":"not-json"}}</tool_call>',
     ],
 )
-def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block):
+def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block, monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_RETRY", "0")  # parser pass-through behaviour, not the retry
     text = f"before {block} after"
     expected_calls, expected_content = extract_tool_calls(text, {"read_file"})
     assert expected_calls == [] and "tool_call" in expected_content
@@ -1145,6 +1147,58 @@ def test_lazy_stream_preserves_provider_error_and_client_cancellation():
     asyncio.run(scenario())
     assert run.cancelled and not client._runs
     assert agent.closed
+
+
+def test_multiple_calls_in_one_block_are_all_parsed():
+    from hermes_cursor_provider.client import extract_tool_calls
+
+    text = (
+        "<tool_call>\n"
+        '{"id":"call_1","type":"function","function":{"name":"kanban_show","arguments":"{\\"task_id\\":\\"t_1\\"}"}}\n'
+        '{"id":"call_2","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"x\\",\\"limit\\":3}"}}\n'
+        "</tool_call>"
+    )
+    calls, rest = extract_tool_calls(text, {"kanban_show", "web_search"})
+    assert [c.function.name for c in calls] == ["kanban_show", "web_search"]
+    assert [c.id for c in calls] == ["call_1", "call_2"]
+    assert rest == ""
+
+
+def test_block_with_only_unknown_or_placeholder_is_still_rejected():
+    from hermes_cursor_provider.client import extract_tool_calls
+
+    calls, _ = extract_tool_calls("<tool_call>{...}</tool_call>", {"kanban_show"})
+    assert calls == []
+    calls, _ = extract_tool_calls(
+        '<tool_call>{"id":"c","function":{"name":"nope","arguments":"{}"}}</tool_call>', {"kanban_show"}
+    )
+    assert calls == []
+
+
+def test_identical_calls_in_one_reply_are_deduplicated():
+    allowed = {"kanban_request_review", "read_file"}
+    call = '{"id":"call_1","type":"function","function":{"name":"kanban_request_review","arguments":{"task_id":"t_1"}}}'
+    text = "".join(f"<tool_call>{call}</tool_call>" for _ in range(20))
+    calls, _ = client_module.extract_tool_calls(text, allowed)
+    assert len(calls) == 1
+    assert calls[0].function.name == "kanban_request_review"
+
+
+def test_same_tool_with_different_args_is_kept_and_ids_made_unique():
+    allowed = {"read_file"}
+    a = '{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"a.py"}}}'
+    b = '{"id":"call_1","type":"function","function":{"name":"read_file","arguments":{"path":"b.py"}}}'
+    calls, _ = client_module.extract_tool_calls(f"<tool_call>{a}</tool_call><tool_call>{b}</tool_call>", allowed)
+    assert [json.loads(c.function.arguments)["path"] for c in calls] == ["a.py", "b.py"]
+    assert len({c.id for c in calls}) == 2
+
+
+def test_argument_key_order_does_not_defeat_dedup():
+    allowed = {"read_file"}
+    a = '{"type":"function","function":{"name":"read_file","arguments":{"path":"a.py","limit":5}}}'
+    b = '{"type":"function","function":{"name":"read_file","arguments":{"limit":5,"path":"a.py"}}}'
+    calls, _ = client_module.extract_tool_calls(f"<tool_call>{a}</tool_call><tool_call>{b}</tool_call>", allowed)
+    assert len(calls) == 1
 
 
 # --- model parameter selection (model@key=value,...) ---
