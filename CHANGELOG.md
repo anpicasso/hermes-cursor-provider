@@ -5,6 +5,8 @@
 - Adds bounded recovery for short action-only replies and unsatisfied required tool choices, without enabling Cursor-native tools.
 - Keeps substantive first-person answers that continue after a colon, semicolon, or spaced dash out of action-only recovery, and treats malformed or unoffered tool blocks after an announcement as rejected protocol instead of leaking raw XML as the final answer.
 - Keeps buffered answers, streamed output, and retained history consistent when rejected protocol is withheld; reports usage summed across discarded recovery attempts, including cache reads and writes.
+- Logs a warning when the model list cannot be loaded (for example, `cursor-sdk` is not installed in Hermes' Python environment) instead of silently showing only the seed models.
+- README: troubleshooting for a model picker that shows only `auto` and `composer-2.5`.
 
 ## 0.3.6
 

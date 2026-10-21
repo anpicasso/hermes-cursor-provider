@@ -48,6 +48,10 @@ hermes gateway restart
 
 Version 0.2 removes the private `api2.cursor.sh` protocol, browser-token OAuth flow, protobuf payloads, and emulated CLI identity. Run `hermes auth add cursor` once to store a Cursor user API key. Old `CURSOR_ACCESS_TOKEN` credentials are not used.
 
+## Troubleshooting
+
+If `hermes model` lists only `auto` and `composer-2.5`, the account model list did not load. Hermes logs a warning with the reason. The most common cause is that `cursor-sdk` is not installed in the Python environment Hermes runs with. Install it there (`cursor-sdk>=1.0.32,<2`), then run `hermes model --refresh`, because the picker caches the seed list.
+
 ## Security model
 
 - Credentials are passed only to the official SDK; custom provider URLs are rejected before bridge launch.
