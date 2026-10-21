@@ -279,6 +279,16 @@ class RecoveryTests(unittest.TestCase):
                         self.assertEqual(len(self.sdk.messages) - before, 2)
                         self.assertFalse(self.sdk.runs)
 
+    def test_announced_action_with_rejected_blocks_gets_two_nudges(self):
+        failed = ANNOUNCEMENT + "\n" + MALFORMED_CALL
+        self.sdk.runs.extend([OfflineRun(failed), OfflineRun(failed), OfflineRun(CALL)])
+        before = len(self.sdk.messages)
+        response = self.request()
+        self.assertEqual(response.choices[0].message.tool_calls[0].function.name, "skill_view")
+        self.assertIsNone(response.choices[0].message.content)
+        self.assertEqual(len(self.sdk.messages) - before, 3)
+        self.assertFalse(self.sdk.runs)
+
     def test_malformed_block_before_valid_call_is_not_returned_or_stored(self):
         for streaming in (False, True):
             for label, block in (("malformed", MALFORMED_CALL), ("unoffered", UNOFFERED_CALL)):
