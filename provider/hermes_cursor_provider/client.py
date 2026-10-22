@@ -155,23 +155,43 @@ def classify_cursor_error(
     body: dict | None = None,
     model: str = "",
 ) -> dict[str, Any] | None:
-    """Terminal verdict for the plugin's fail-closed plan-only raise, and nothing else.
+    """Terminal verdict for the plugin's fail-closed raises, and nothing else.
 
     Runs for every Cursor failure before the status and message paths. Returning a
     verdict for anything else would make a 429 usage limit non-retryable and
     non-fallback, disabling credential rotation and the host's provider fallback for
-    all of them. Decline unless the structured code proves this is the plan-only
-    raise: a model that announced a tool call, was nudged twice, and still produced
-    no call. Falling back to a different model there answers with a different model
-    and never says so, which is the failure this classification prevents.
+    all of them. Decline unless the structured code proves this is one of our own
+    raises: a model that announced a tool call and produced none, or a Cursor-rejected
+    model parameter. Falling back to a different model in either case answers with a
+    different model and never says so, which is the failure this classification prevents.
     """
-    if str(error_code or "").strip().lower() != "cursor_plan_only":
+    code = str(error_code or "").strip().lower()
+    # Two different failures, two different reasons. A plan-only exhaustion is not a malformed
+    # request: the model announced an action, was nudged twice, and never produced a call --
+    # ``incomplete_response`` says exactly that, and ``format_error`` would tell the user to
+    # start a clean session over a request that was fine. A rejected model parameter *is* a bad
+    # request, so it keeps ``format_error`` and its accurate copy.
+    reasons = {
+        "cursor_plan_only": "incomplete_response",
+        "cursor_invalid_params": "format_error",
+    }
+    reason = reasons.get(code)
+    if reason is None:
         return None
-    # ``incomplete_response`` is the host's reason for "the turn produced no answer and no
-    # tool call after a nudge". ``format_error`` would be closer to hand but its terminal copy
-    # tells the user the request was malformed and to start a clean session, which misdiagnoses
-    # this failure. Both are terminal once the hints below are set; this one describes it.
-    return {"reason": "incomplete_response", "retryable": False, "should_fallback": False}
+    return {"reason": reason, "retryable": False, "should_fallback": False}
+
+
+# Cursor failure texts that describe a CONFIGURATION error: identical parameters can never
+# succeed on retry, and a fallback would answer from a different model without saying so.
+_PERMANENT_ERROR_HINTS = ("invalid parameters", "ai model not found")
+
+
+def _permanent_error_code(failure: Any) -> str:
+    """The terminal provider code for a permanent Cursor configuration failure, else ''."""
+    text = str(failure or "").lower()
+    if any(hint in text for hint in _PERMANENT_ERROR_HINTS):
+        return "cursor_invalid_params"
+    return ""
 
 
 def _run_timeout_seconds() -> float:
@@ -1766,6 +1786,18 @@ class CursorSDKClient:
                 status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
                 status = str(status_value or "").upper()
                 if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                    # A permanent configuration failure must not be retried or silently
+                    # answered by another provider: mark it terminal for the classifier.
+                    # The text can arrive as a stream-event message or as the result's status
+                    # message depending on the path, so both are checked.
+                    detail = str(failure or getattr(result, "status_message", "") or "")
+                    code = _permanent_error_code(detail)
+                    if code:
+                        raise CursorSDKRunError(
+                            detail or f"Cursor SDK run ended with status {status}",
+                            status_code=400,
+                            error_code=code,
+                        )
                     raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
                 tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
                 if tail:

@@ -56,6 +56,51 @@ def test_plan_only_is_classified_terminal_and_does_not_fall_back():
     }
 
 
+def test_invalid_params_is_classified_terminal_with_the_malformed_request_reason():
+    """A rejected model parameter IS a bad request, so it keeps format_error's copy."""
+    assert classify_cursor_error(error_code="cursor_invalid_params") == {
+        "reason": "format_error",
+        "retryable": False,
+        "should_fallback": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("AI Model Not Found Invalid parameters for registry model", "cursor_invalid_params"),
+        ("Invalid parameters: reasoning_effort", "cursor_invalid_params"),
+        ("You're out of usage. Switch to Auto.", ""),
+        ("", ""),
+    ],
+)
+def test_permanent_error_code_matches_configuration_failures_only(text, expected):
+    assert client_module._permanent_error_code(text) == expected
+
+
+def test_permanent_configuration_failure_raises_a_terminal_code():
+    """The wiring, not just the helper: the raise carries the code the classifier keys on.
+
+    Live QA produced this exact text for reasoning_effort=bogus; without the code it burned
+    three runs and was answered by another provider.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    sdk.result.status = "ERROR"
+    sdk.result.status_message = "AI Model Not Found Invalid parameters for registry model"
+    try:
+        with pytest.raises(client_module.CursorSDKRunError) as excinfo:
+            client.chat.completions.create(
+                model="composer-2.5",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+    finally:
+        client.close()
+    assert excinfo.value.error_code == "cursor_invalid_params"
+    assert excinfo.value.status_code == 400
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
