@@ -1452,3 +1452,156 @@ def test_listing_skips_malformed_unknown_bare_and_duplicate_variants(monkeypatch
         "grok-4.7",
         "composer-2.5@fast=true",
     ]
+
+
+def _usage_of(tokens, *, output=0, cached=0, written=0):
+    """One SDK ``TokenUsage``-shaped record holding a single turn's numbers."""
+    return SimpleNamespace(
+        input_tokens=tokens,
+        output_tokens=output,
+        cache_read_tokens=cached,
+        cache_write_tokens=written,
+    )
+
+
+def test_billed_totals_stay_billed_while_the_context_anchor_is_one_turn():
+    """Hermes needs both numbers: the SDK's billed run total and one prompt's size.
+
+    ``usage.prompt_tokens`` feeds session totals and cost, so it must stay the sum the SDK
+    reports (598,980 across two ~241k-token turns). ``usage.initial_prompt_tokens`` is the
+    separate context size Hermes anchors compression on, so it must be a single turn — the
+    run total would place a session above its own window and fail every later turn closed.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(598_980, output=1_000, cached=500, written=60)
+        _scripted_run(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(240_000, cached=200)),
+                SimpleNamespace(type="usage", usage=_usage_of(241_305, cached=250)),
+                _assistant_event("done"),
+            ],
+        )
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    usage = response.usage
+    assert usage.prompt_tokens == 598_980, "billing lost the SDK's summed input"
+    assert usage.completion_tokens == 1_000, "billing lost the SDK's summed output"
+    assert usage.prompt_tokens_details.cached_tokens == 500
+    assert usage.prompt_tokens_details.cache_write_tokens == 60
+    assert usage.initial_prompt_tokens == 241_305, (
+        "context anchor is not a single turn's prompt"
+    )
+    assert usage.initial_cached_tokens == 250, "context anchor lost that turn's cache read"
+
+
+def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
+    """A run that reports several turns must keep the peak, not whatever arrived last.
+
+    Cursor's per-turn ``input_tokens`` is not a stable thread size: one live thread
+    measured 14,191 then 8,686 across calls. Keeping the last event would understate the
+    context, which lets a session overflow before compression fires.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(21_995)
+        _scripted_run(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(13_778)),
+                SimpleNamespace(type="usage", usage=_usage_of(8_217)),
+                _assistant_event("done"),
+            ],
+        )
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    assert response.usage.initial_prompt_tokens == 13_778, (
+        "a smaller later turn overwrote the peak prompt reading"
+    )
+
+
+def test_no_usage_event_falls_back_to_the_run_result():
+    """A runtime that emits no per-turn event keeps its billed usage and no anchor."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(1234)
+        _scripted_run(sdk, [_assistant_event("done")])
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    assert response.usage.prompt_tokens == 1234
+    assert not hasattr(response.usage, "initial_prompt_tokens"), (
+        "invented a context anchor with no per-turn evidence"
+    )
+
+
+def test_streaming_path_reports_billed_totals_and_the_context_anchor():
+    """Streamed/Relay chunks read the same result, so the final chunk carries both fields."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        sdk.result.usage = _usage_of(300_000)
+        _scripted_run(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(120_000)),
+                SimpleNamespace(type="usage", usage=_usage_of(180_000)),
+                _assistant_event("done"),
+            ],
+        )
+        chunks = list(
+            client.chat.completions.create(
+                model="auto", messages=[{"role": "user", "content": "hi"}], stream=True
+            )
+        )
+    finally:
+        client.close()
+    final = [chunk for chunk in chunks if getattr(chunk, "usage", None)]
+    assert final, "no usage-bearing chunk was emitted"
+    assert final[-1].usage.prompt_tokens == 300_000
+    assert final[-1].usage.initial_prompt_tokens == 180_000
+
+
+def test_retry_aggregation_sums_billing_but_not_the_context_anchor():
+    """Three 240k/241k/242k-prompt attempts bill 723k; the context never exceeded 242k.
+
+    Summing the anchor too is what made Hermes report 723k for a session that fit its
+    window, so aggregation has to keep the peak while still adding up real spend.
+    """
+    attempts = [
+        (
+            SimpleNamespace(
+                model=None,
+                usage=_usage_of(prompt, output=output, cached=cached, written=written),
+            ),
+            _usage_of(prompt, output=output, cached=cached, written=written),
+        )
+        for prompt, output, cached, written in (
+            (240_000, 10, 3, 1),
+            (241_000, 10, 4, 2),
+            (242_000, 20, 5, 3),
+        )
+    ]
+    result = client_module._aggregate_result(attempts)
+    assert result.usage.input_tokens == 723_000
+    assert result.usage.output_tokens == 40
+    assert result.usage.cache_read_tokens == 12
+    assert result.usage.cache_write_tokens == 6
+    assert result.initial_prompt_tokens == 242_000
+    assert result.initial_cached_tokens == 5

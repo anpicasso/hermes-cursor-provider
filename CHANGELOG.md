@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Keeps `usage.prompt_tokens`, `completion_tokens`, and the cache details as the SDK's **billed totals** (summed across every turn and every recovery attempt), and reports the run's **largest single turn** separately through `usage.initial_prompt_tokens` / `usage.initial_cached_tokens` — the hook Hermes reads as the size of the request it just sent. Replacing the whole usage object with the peak (as the previous revision did) dropped the other turns' output and cache spend from billing, and summing the anchor across recovery attempts reports 723k for three 240k/241k/242k-token prompts, failing a session that fits its window closed as "too large to compress further". The peak, not the last event: a run's turns are not ordered by size (one live thread measured 14,191 then 8,686 on consecutive calls). A run with no per-turn event keeps `result.usage` and reports no anchor. The context split requires Hermes >= 0.22.0; older hosts ignore the extra fields and anchor on the billed total.
+
 ## 0.4.0
 
 - Handles the SDK's native `tool_call` events. When the model calls an offered Hermes tool through Cursor's native channel (which the runtime answers with "Tool not found"), the call is converted into a Hermes tool call and the run is cancelled. Disable with `HERMES_CURSOR_INTERCEPT_NATIVE=0`.
