@@ -25,6 +25,11 @@ from typing import Any, Iterable, cast
 CURSOR_API_URL = "https://api.cursor.com"
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
+# Wall-clock cap for one Cursor SDK run. ``run.wait()`` has no bounded wait of its own,
+# so without this a stalled run holds the Hermes turn open indefinitely.
+_DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
+_MIN_RUN_TIMEOUT_SECONDS = 0.05
+_MAX_RUN_TIMEOUT_SECONDS = 86_400.0
 
 _LOG = logging.getLogger("hermes_cursor_provider")
 _FALSEY = {"0", "false", "no", "off", ""}
@@ -119,11 +124,85 @@ def match_allowed_name(name: Any, allowed: set[str]) -> str | None:
 class CursorSDKRunError(RuntimeError):
     """A terminal Cursor SDK run failure with Hermes-readable status."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         lowered = message.lower()
-        self.status_code = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
-        self.error_code = "cursor_sdk_run_failed"
+        default_status = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
+        self.status_code = status_code if status_code is not None else default_status
+        self.error_code = error_code or "cursor_sdk_run_failed"
+
+
+def _run_timeout_seconds() -> float:
+    """How long one SDK run may take before the plugin stops waiting, in seconds.
+
+    Default 1800 s (30 min): long enough for a legitimate large-context call, short
+    enough to fail before an operator or a supervisor kills the whole turn. A malformed
+    or non-positive value falls back to the default — the cap exists to stop the hang,
+    so it cannot be switched off.
+    """
+    raw = os.environ.get("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_RUN_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        _LOG.warning("cursor: ignoring malformed HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
+        return _DEFAULT_RUN_TIMEOUT_SECONDS
+    if value <= 0:
+        _LOG.warning("cursor: ignoring non-positive HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
+        return _DEFAULT_RUN_TIMEOUT_SECONDS
+    return min(max(value, _MIN_RUN_TIMEOUT_SECONDS), _MAX_RUN_TIMEOUT_SECONDS)
+
+
+def _run_timeout_error(cap: float, elapsed: float) -> CursorSDKRunError:
+    """The loud end of a stalled run: a timeout Hermes can retry or fall back from."""
+    return CursorSDKRunError(
+        f"Cursor SDK run did not finish within {cap:g}s ({elapsed:g}s elapsed); Hermes "
+        "stopped waiting instead of hanging the turn. Raise "
+        "HERMES_CURSOR_RUN_TIMEOUT_SECONDS if this workload legitimately needs longer.",
+        status_code=408,
+        error_code="cursor_run_timeout",
+    )
+
+
+def _bounded_wait(run: Any, *, cap: float, started: float) -> Any:
+    """``run.wait()`` with a deadline, because the SDK's own wait never gives up.
+
+    The wait runs on a daemon thread so the caller keeps control; at the deadline the run
+    is cancelled and a 408 is raised instead of holding the Hermes turn open. Trade-off:
+    a worker wedged inside the SDK is abandoned (daemon thread) rather than joined — one
+    lost thread, only for a run that was already pathological.
+
+    Scope note: this bounds the *result* wait, not a stall inside ``run.stream()``. The
+    stream is pulled lazily by the consumer, and upstream's streaming contract (tests
+    included) depends on that: a fragment can be computed only after the consumer has
+    handled the previous one. Bounding a stream read therefore needs a changed streaming
+    contract, not a timeout.
+    """
+    outcome: dict[str, Any] = {}
+
+    def _wait() -> None:
+        try:
+            outcome["result"] = run.wait()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_wait, name="cursor-sdk-wait", daemon=True)
+    worker.start()
+    worker.join(max(0.0, cap - (time.monotonic() - started)))
+    if worker.is_alive():
+        with suppress(Exception):
+            run.cancel()
+        raise _run_timeout_error(cap, time.monotonic() - started)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
 
 
 def _plain(value: Any) -> Any:
@@ -1242,6 +1321,9 @@ class CursorSDKClient:
         # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
         # run-wide sum, so it can never stand in for one prompt (see _context_fields).
         peak_usage: Any = None
+        # Deadline for this run's result wait. The streaming pull stays lazy and unchanged.
+        cap = _run_timeout_seconds()
+        started = time.monotonic()
         stream = getattr(run, "stream", None)
         if callable(stream):
             for event in cast(Iterable[Any], stream()):
@@ -1338,7 +1420,7 @@ class CursorSDKClient:
                 run.cancel()
             result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
             return result, streamed, "", True, peak_usage
-        result = run.wait()
+        result = _bounded_wait(run, cap=cap, started=started)
         # ``result.usage`` stays the SDK's billed total; the peak turn rides alongside so the
         # response can expose it as Hermes' separate context anchor.
         return result, streamed, failure, False, peak_usage
