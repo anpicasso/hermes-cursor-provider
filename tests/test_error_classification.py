@@ -74,6 +74,9 @@ def test_every_other_failure_is_left_to_the_host(kwargs):
 
 def test_the_classification_is_registered_on_the_profile(monkeypatch):
     """A verdict nobody wired into the profile is dead code."""
+    import importlib.util
+    from pathlib import Path
+
     providers = types.ModuleType("providers")
     base = types.ModuleType("providers.base")
 
@@ -87,9 +90,18 @@ def test_the_classification_is_registered_on_the_profile(monkeypatch):
     providers.register_provider = registered.append
     monkeypatch.setitem(sys.modules, "providers", providers)
     monkeypatch.setitem(sys.modules, "providers.base", base)
-    sys.modules.pop("provider", None)
 
-    provider = importlib.import_module("provider")
+    # Load the plugin package by path: its name is not importable on every runner,
+    # and this must not depend on the working directory or pytest's import mode.
+    package_dir = Path(__file__).resolve().parents[1] / "provider"
+    spec = importlib.util.spec_from_file_location(
+        "cursor_provider_under_test",
+        package_dir / "__init__.py",
+        submodule_search_locations=[str(package_dir)],
+    )
+    provider = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = provider
+    spec.loader.exec_module(provider)
 
     assert registered and registered[0] is provider.profile
     verdict = provider.profile.classify_api_error
