@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -25,11 +26,18 @@ from typing import Any, Iterable, cast
 CURSOR_API_URL = "https://api.cursor.com"
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
-# Wall-clock cap for one Cursor SDK run. ``run.wait()`` has no bounded wait of its own,
-# so without this a stalled run holds the Hermes turn open indefinitely.
+# Wall-clock cap for one Cursor SDK run. The cap covers the run's Send stream and its
+# result wait; the SDK offers no total-deadline option, so the plugin enforces it.
 _DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 _MIN_RUN_TIMEOUT_SECONDS = 0.05
 _MAX_RUN_TIMEOUT_SECONDS = 86_400.0
+# A completed run's ``wait()`` returns from the SDK's cache; this small grace keeps a
+# cached result collectable when the stream consumed the cap exactly.
+_WAIT_COMPLETION_GRACE_SECONDS = 0.05
+# Best-effort cancel/close calls get a short, cap-scaled budget so cleanup cannot add
+# another full transport timeout to a turn that has already hit its deadline.
+_CLEANUP_MIN_SECONDS = 0.1
+_CLEANUP_MAX_SECONDS = 2.0
 
 _LOG = logging.getLogger("hermes_cursor_provider")
 _FALSEY = {"0", "false", "no", "off", ""}
@@ -142,9 +150,9 @@ def _run_timeout_seconds() -> float:
     """How long one SDK run may take before the plugin stops waiting, in seconds.
 
     Default 1800 s (30 min): long enough for a legitimate large-context call, short
-    enough to fail before an operator or a supervisor kills the whole turn. A malformed
-    or non-positive value falls back to the default — the cap exists to stop the hang,
-    so it cannot be switched off.
+    enough to fail before an operator or a supervisor kills the whole turn. A malformed,
+    non-finite, or non-positive value falls back to the default — the cap exists to stop
+    the hang, so it cannot be switched off or turned into an instant timeout.
     """
     raw = os.environ.get("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "").strip()
     if not raw:
@@ -154,55 +162,149 @@ def _run_timeout_seconds() -> float:
     except ValueError:
         _LOG.warning("cursor: ignoring malformed HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
         return _DEFAULT_RUN_TIMEOUT_SECONDS
-    if value <= 0:
-        _LOG.warning("cursor: ignoring non-positive HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
+    if not math.isfinite(value) or value <= 0:
+        _LOG.warning("cursor: ignoring invalid HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
         return _DEFAULT_RUN_TIMEOUT_SECONDS
     return min(max(value, _MIN_RUN_TIMEOUT_SECONDS), _MAX_RUN_TIMEOUT_SECONDS)
 
 
-def _run_timeout_error(cap: float, elapsed: float) -> CursorSDKRunError:
-    """The loud end of a stalled run: a timeout Hermes can retry or fall back from."""
+def _run_timeout_error(cap: float, elapsed: float, phase: str) -> CursorSDKRunError:
+    """The loud end of a stalled run: a retryable timeout Hermes can act on."""
     return CursorSDKRunError(
-        f"Cursor SDK run did not finish within {cap:g}s ({elapsed:g}s elapsed); Hermes "
-        "stopped waiting instead of hanging the turn. Raise "
+        f"Cursor SDK run exceeded its {cap:g}s deadline after {elapsed:g}s while {phase}; "
+        "Hermes stopped waiting instead of hanging the turn. Raise "
         "HERMES_CURSOR_RUN_TIMEOUT_SECONDS if this workload legitimately needs longer.",
         status_code=408,
         error_code="cursor_run_timeout",
     )
 
 
-def _bounded_wait(run: Any, *, cap: float, started: float) -> Any:
-    """``run.wait()`` with a deadline, because the SDK's own wait never gives up.
+class _ReadOutcome:
+    """Exactly-once handoff between one bounded read and its caller.
 
-    The wait runs on a daemon thread so the caller keeps control; at the deadline the run
-    is cancelled and a 408 is raised instead of holding the Hermes turn open. Trade-off:
-    a worker wedged inside the SDK is abandoned (daemon thread) rather than joined — one
-    lost thread, only for a run that was already pathological.
-
-    Scope note: this bounds the *result* wait, not a stall inside ``run.stream()``. The
-    stream is pulled lazily by the consumer, and upstream's streaming contract (tests
-    included) depends on that: a fragment can be computed only after the consumer has
-    handled the previous one. Bounding a stream read therefore needs a changed streaming
-    contract, not a timeout.
+    ``publish`` is the worker's claim and ``take`` is the caller's; both decide under
+    one lock. A published value is returned to the caller. An abandoned read hands the
+    value back to ``late`` cleanup. A result that lands at the deadline therefore
+    cannot fall between the two: either the caller takes it, or the worker cleans it up.
     """
-    outcome: dict[str, Any] = {}
 
-    def _wait() -> None:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._abandoned = False
+        self.value: Any = None
+        self.error: BaseException | None = None
+
+    def publish(self, *, value: Any = None, error: BaseException | None = None) -> bool:
+        """Publish the read's outcome; False means the caller already gave up."""
+        with self._lock:
+            if self._abandoned:
+                return False
+            self.value = value
+            self.error = error
+            self._done.set()
+            return True
+
+    def wait(self, timeout: float) -> None:
+        self._done.wait(timeout)
+
+    def take(self) -> bool:
+        """Claim the published outcome, or abandon the read for ``late`` cleanup."""
+        with self._lock:
+            if self._done.is_set():
+                return True
+            self._abandoned = True
+            return False
+
+
+def _bounded_call(
+    call: Any,
+    *,
+    deadline: float,
+    cap: float,
+    started: float,
+    phase: str,
+    grace: float = 0.0,
+    late: Any = None,
+) -> Any:
+    """Run one blocking SDK operation on a daemon thread, bounded by ``deadline``.
+
+    ``run.stream()`` is lazy: every ``next()`` and ``run.wait()`` is a separate blocking
+    transport read. Bounding each read against the same deadline keeps delivery lazy and
+    backpressure intact (exactly one read is in flight, and only when the consumer asks)
+    while making the cap cover the real stream/wait path rather than only ``wait()``.
+
+    At the deadline the caller raises immediately; the worker is abandoned (daemon
+    thread) because a wedged transport read cannot be interrupted. ``late`` receives an
+    operation result that arrives after the caller gave up, so a timed-out ``send()`` can
+    still cancel the run it eventually created. ``_ReadOutcome`` guarantees that cleanup
+    runs exactly once, even when the result lands while the caller is timing out.
+    """
+    outcome = _ReadOutcome()
+
+    def _invoke() -> None:
         try:
-            outcome["result"] = run.wait()
+            value = call()
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
-            outcome["error"] = exc
+            outcome.publish(error=exc)
+        else:
+            if not outcome.publish(value=value) and late is not None:
+                try:
+                    late(value)
+                except Exception:  # cleanup must never mask the timeout
+                    pass
 
-    worker = threading.Thread(target=_wait, name="cursor-sdk-wait", daemon=True)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 and grace <= 0:
+        raise _run_timeout_error(cap, time.monotonic() - started, phase)
+    # ponytail: one short-lived thread per blocking read. A persistent demand-driven
+    # worker would cut thread churn, but add lifecycle state for no measured gain here.
+    worker = threading.Thread(target=_invoke, name="cursor-sdk-read", daemon=True)
     worker.start()
-    worker.join(max(0.0, cap - (time.monotonic() - started)))
-    if worker.is_alive():
+    outcome.wait(max(remaining, grace))
+    if not outcome.take():
+        raise _run_timeout_error(cap, time.monotonic() - started, phase)
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.value
+
+
+def _cleanup_grace_seconds() -> float:
+    """A short, cap-scaled budget for one best-effort cancel/close call."""
+    return max(
+        _CLEANUP_MIN_SECONDS,
+        min(_CLEANUP_MAX_SECONDS, _run_timeout_seconds() / 1000.0),
+    )
+
+
+def _run_cleanup(call: Any, what: str) -> None:
+    """Run one cleanup call without letting a wedged transport add a full timeout.
+
+    Cleanup still happens on a worker so a hung ``CancelRun``/``CloseAgent`` cannot
+    push a turn past its deadline. If it outlives the grace it is abandoned; the SDK's
+    own unary timeout eventually reclaims the worker.
+    """
+    grace = _cleanup_grace_seconds()
+
+    def _invoke() -> None:
         with suppress(Exception):
-            run.cancel()
-        raise _run_timeout_error(cap, time.monotonic() - started)
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome.get("result")
+            call()
+
+    worker = threading.Thread(target=_invoke, name="cursor-sdk-cleanup", daemon=True)
+    worker.start()
+    worker.join(grace)
+    if worker.is_alive():
+        _LOG.warning("cursor: %s did not finish within %gs; abandoning the call", what, grace)
+
+
+def _cancel_run(run: Any) -> None:
+    if run is not None:
+        _run_cleanup(run.cancel, "cancel the Cursor run")
+
+
+def _close_agent(agent: Any) -> None:
+    if agent is not None:
+        _run_cleanup(agent.close, "close the Cursor agent")
 
 
 def _plain(value: Any) -> Any:
@@ -1017,7 +1119,16 @@ class _Bridge:
                     workspace=self.workspace.name,
                     state_root=str(Path(self.workspace.name) / "state"),
                     local={"cwd": self.workspace.name},
-                    allow_api_key_env_fallback=False,
+                    # Local bridge only: the SDK classifies run-scoped CancelRun/
+                    # WaitLiveRun as cloud-routed, and its Client methods carry no
+                    # apiKey, so with the guard on they fail before reaching this
+                    # bridge. The flag's env fallback is not used by this plugin:
+                    # CreateAgent/ListModels always receive the explicit account key,
+                    # Send injects the agent's stored key, and a missing plugin key
+                    # fails in _validate_request before any launch. Run-scoped calls
+                    # carry no key; the local bridge resolves the live run created
+                    # with it.
+                    allow_api_key_env_fallback=True,
                 )
             return self.sdk
 
@@ -1066,8 +1177,7 @@ def _bridge_for(home: str) -> _Bridge:
 
 def _close_session(session: _Session) -> None:
     if session.agent is not None:
-        with suppress(Exception):
-            session.agent.close()
+        _close_agent(session.agent)
         session.agent = None
     session.history.clear()
     shutil.rmtree(session.cwd, ignore_errors=True)
@@ -1198,10 +1308,7 @@ class _LazyStream:
             self._iterator.close()
         except ValueError:
             # A worker thread is inside next(); cancel its run so it unwinds there.
-            run = self._control.run
-            if run is not None:
-                with suppress(Exception):
-                    run.cancel()
+            _cancel_run(self._control.run)
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
@@ -1261,8 +1368,7 @@ class CursorSDKClient:
         with self._runs_lock:
             runs = tuple(self._runs)
         for run in runs:
-            with suppress(Exception):
-                run.cancel()
+            _cancel_run(run)
 
     def close(self) -> None:
         if self.is_closed:
@@ -1278,8 +1384,12 @@ class CursorSDKClient:
         model: str | None,
         timeout: float,
     ) -> Any:
-        client = bridge.client().with_options(
+        setup_client = bridge.client().with_options(
             timeout=timeout,
+            # Keep the SDK's compact unary bound (30 s cap) for setup and for the
+            # agent's run-scoped CancelRun/WaitLiveRun/CloseAgent calls. The plugin's
+            # external deadline bounds how long it waits; stretching the transport's
+            # own timeout would only retain abandoned cleanup workers longer.
             unary_timeout=min(timeout, 30.0),
             stream_timeout=timeout,
         )
@@ -1291,7 +1401,7 @@ class CursorSDKClient:
         }
         selected_model = _model_selection(model)
         if isinstance(selected_model, dict):
-            catalog = _model_parameter_values(client.list_models(api_key=self.api_key))
+            catalog = _model_parameter_values(setup_client.list_models(api_key=self.api_key))
             error = _parameter_error(
                 selected_model["id"], selected_model["params"], catalog
             )
@@ -1299,7 +1409,7 @@ class CursorSDKClient:
                 raise ValueError(error)
         if selected_model:
             options["model"] = selected_model
-        return client.create_agent(options)
+        return setup_client.create_agent(options)
 
     def _consume(
         self,
@@ -1307,6 +1417,10 @@ class CursorSDKClient:
         parser: "_ToolBlockStream",
         allowed_names: set[str],
         native: dict[str, Any],
+        *,
+        deadline: float,
+        cap: float,
+        started: float,
     ) -> Any:
         """Stream one SDK run into ``parser``; returns (result, streamed, failure, stopped, peak).
 
@@ -1321,12 +1435,20 @@ class CursorSDKClient:
         # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
         # run-wide sum, so it can never stand in for one prompt (see _context_fields).
         peak_usage: Any = None
-        # Deadline for this run's result wait. The streaming pull stays lazy and unchanged.
-        cap = _run_timeout_seconds()
-        started = time.monotonic()
         stream = getattr(run, "stream", None)
         if callable(stream):
-            for event in cast(Iterable[Any], stream()):
+            iterator = iter(cast(Iterable[Any], stream()))
+            while True:
+                try:
+                    event = _bounded_call(
+                        lambda: next(iterator),
+                        deadline=deadline,
+                        cap=cap,
+                        started=started,
+                        phase="reading the run stream",
+                    )
+                except StopIteration:
+                    break
                 kind = str(getattr(event, "type", ""))
                 if stopping and kind != "tool_call":
                     # The intercepted batch is complete; cancel before nested work or text runs.
@@ -1395,7 +1517,18 @@ class CursorSDKClient:
         else:
             iter_text = getattr(run, "iter_text", None)
             if callable(iter_text):
-                for part in cast(Iterable[str], iter_text()):
+                iterator = iter(cast(Iterable[str], iter_text()))
+                while True:
+                    try:
+                        part = _bounded_call(
+                            lambda: next(iterator),
+                            deadline=deadline,
+                            cap=cap,
+                            started=started,
+                            phase="reading the run stream",
+                        )
+                    except StopIteration:
+                        break
                     text = str(part or "")
                     if text:
                         streamed += text
@@ -1416,13 +1549,17 @@ class CursorSDKClient:
             # A terminal native call was accepted; the run is cancelled rather than waited on.
             stopped = True
         if stopped:
-            with suppress(Exception):
-                run.cancel()
+            _cancel_run(run)
             result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
             return result, streamed, "", True, peak_usage
-        result = _bounded_wait(run, cap=cap, started=started)
-        # ``result.usage`` stays the SDK's billed total; the peak turn rides alongside so the
-        # response can expose it as Hermes' separate context anchor.
+        result = _bounded_call(
+            run.wait,
+            deadline=deadline,
+            cap=cap,
+            started=started,
+            phase="waiting for the run result",
+            grace=_WAIT_COMPLETION_GRACE_SECONDS,
+        )
         return result, streamed, failure, False, peak_usage
 
     def _run_agent(
@@ -1562,9 +1699,21 @@ class CursorSDKClient:
         parser = _ToolBlockStream(allowed_names)
         native: dict[str, Any] = {"ids": set(), "pending": {}, "intercepted": [], "misses": []}
         info = info if info is not None else {}
+        # Start the clock before ``send()``: the SDK's Run constructor primes the Send
+        # stream, so a stalled first byte is part of the run's blocking path too.
+        cap = _run_timeout_seconds()
+        started = time.monotonic()
+        deadline = started + cap
         run = None
         try:
-            run = agent.send({"text": prompt, "images": images})
+            run = _bounded_call(
+                lambda: agent.send({"text": prompt, "images": images}),
+                deadline=deadline,
+                cap=cap,
+                started=started,
+                phase="starting the SDK run",
+                late=_cancel_run,
+            )
             with self._runs_lock:
                 self._runs.add(run)
             if control is not None:
@@ -1573,7 +1722,13 @@ class CursorSDKClient:
                     raise CursorSDKRunError("Cursor stream cancelled during startup")
             try:
                 result, streamed, failure, stopped, context_usage = yield from self._consume(
-                    run, parser, allowed_names, native
+                    run,
+                    parser,
+                    allowed_names,
+                    native,
+                    deadline=deadline,
+                    cap=cap,
+                    started=started,
                 )
             finally:
                 with self._runs_lock:
@@ -1593,9 +1748,7 @@ class CursorSDKClient:
             info["rejected"] = parser.rejected
             return result, parser.calls, parser.text, context_usage
         except BaseException:
-            if run is not None:
-                with suppress(Exception):
-                    run.cancel()
+            _cancel_run(run)
             raise
         finally:
             if control is not None:
@@ -1634,8 +1787,7 @@ class CursorSDKClient:
                     )
                 )
             finally:
-                with suppress(Exception):
-                    agent.close()
+                _close_agent(agent)
 
     def _execute(
         self,
@@ -1709,8 +1861,7 @@ class CursorSDKClient:
                 and incoming[: len(session.history)] == session.history
             )
             if session.agent is not None and not extends:
-                with suppress(Exception):
-                    session.agent.close()
+                _close_agent(session.agent)
                 session.agent = None
                 session.history.clear()
 
@@ -1743,8 +1894,7 @@ class CursorSDKClient:
             ):
                 # The retained agent now remembers failed native-tool rounds; start clean next turn.
                 _LOG.warning("cursor provider: resetting retained SDK agent after a failed tool-call turn")
-                with suppress(Exception):
-                    session.agent.close()
+                _close_agent(session.agent)
                 session.agent = None
                 session.history.clear()
                 return result, calls, content
@@ -1752,8 +1902,7 @@ class CursorSDKClient:
             return result, calls, content
         except BaseException:
             if session.agent is not None:
-                with suppress(Exception):
-                    session.agent.close()
+                _close_agent(session.agent)
             session.agent = None
             session.history.clear()
             raise
