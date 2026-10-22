@@ -138,12 +138,21 @@ class CursorSDKRunError(RuntimeError):
         *,
         status_code: int | None = None,
         error_code: str | None = None,
+        body: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         lowered = message.lower()
         default_status = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
         self.status_code = status_code if status_code is not None else default_status
         self.error_code = error_code or "cursor_sdk_run_failed"
+        # The host classifier reads the code off the parsed BODY — ``_body_of(exc)`` then an
+        # ``_extract_error_code`` over ``error.code`` — before it calls this profile's hook. An
+        # exception that carried the code as an attribute alone was invisible to it, so every
+        # "terminal" verdict silently declined and the host fell back to another provider. Attach
+        # the body so the code travels the way the host reads it.
+        self.body = body if body is not None else {
+            "error": {"code": self.error_code, "message": message}
+        }
 
 
 def classify_cursor_error(
@@ -165,7 +174,15 @@ def classify_cursor_error(
     model parameter. Falling back to a different model in either case answers with a
     different model and never says so, which is the failure this classification prevents.
     """
-    code = str(error_code or "").strip().lower()
+    # The host derives ``error_code`` from the response BODY and passes that kwarg through; our own
+    # raises carry the code on the exception and in its body. Read all three, so a raise that forgets
+    # one of them still classifies instead of silently falling back.
+    code = str(
+        error_code
+        or getattr(error, "error_code", "")
+        or (((getattr(error, "body", None) or body or {}).get("error") or {}).get("code"))
+        or ""
+    ).strip().lower()
     # Two different failures, two different reasons. A plan-only exhaustion is not a malformed
     # request: the model announced an action, was nudged twice, and never produced a call --
     # ``incomplete_response`` says exactly that, and ``format_error`` would tell the user to
