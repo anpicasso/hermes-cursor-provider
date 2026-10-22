@@ -146,6 +146,30 @@ class CursorSDKRunError(RuntimeError):
         self.error_code = error_code or "cursor_sdk_run_failed"
 
 
+def classify_cursor_error(
+    error: Any = None,
+    *,
+    status_code: int | None = None,
+    error_code: str = "",
+    message: str = "",
+    body: dict | None = None,
+    model: str = "",
+) -> dict[str, Any] | None:
+    """Terminal verdict for the plugin's fail-closed plan-only raise, and nothing else.
+
+    Runs for every Cursor failure before the status and message paths. Returning a
+    verdict for anything else would make a 429 usage limit non-retryable and
+    non-fallback, disabling credential rotation and the host's provider fallback for
+    all of them. Decline unless the structured code proves this is the plan-only
+    raise: a model that announced a tool call, was nudged twice, and still produced
+    no call. Falling back to a different model there answers with a different model
+    and never says so, which is the failure this classification prevents.
+    """
+    if str(error_code or "").strip().lower() != "cursor_plan_only":
+        return None
+    return {"reason": "format_error", "retryable": False, "should_fallback": False}
+
+
 def _run_timeout_seconds() -> float:
     """How long one SDK run may take before the plugin stops waiting, in seconds.
 
@@ -1653,7 +1677,8 @@ class CursorSDKClient:
                 if fail_on_exhaustion:
                     raise CursorSDKRunError(
                         "Cursor returned no valid Hermes tool call for a required or announced action; "
-                        "recovery exhausted. No tool action was executed by the adapter."
+                        "recovery exhausted. No tool action was executed by the adapter.",
+                        error_code="cursor_plan_only",
                     )
                 yield from held
                 for block in dropped:
