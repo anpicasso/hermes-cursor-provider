@@ -167,7 +167,11 @@ def classify_cursor_error(
     """
     if str(error_code or "").strip().lower() != "cursor_plan_only":
         return None
-    return {"reason": "format_error", "retryable": False, "should_fallback": False}
+    # ``incomplete_response`` is the host's reason for "the turn produced no answer and no
+    # tool call after a nudge". ``format_error`` would be closer to hand but its terminal copy
+    # tells the user the request was malformed and to start a clean session, which misdiagnoses
+    # this failure. Both are terminal once the hints below are set; this one describes it.
+    return {"reason": "incomplete_response", "retryable": False, "should_fallback": False}
 
 
 def _run_timeout_seconds() -> float:

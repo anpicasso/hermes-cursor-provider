@@ -50,7 +50,7 @@ def test_recovery_exhaustion_carries_a_structured_code(fake_sdk):  # noqa: F811
 def test_plan_only_is_classified_terminal_and_does_not_fall_back():
     """The verdict stops the retry and the cross-provider answer."""
     assert classify_cursor_error(error_code="cursor_plan_only") == {
-        "reason": "format_error",
+        "reason": "incomplete_response",
         "retryable": False,
         "should_fallback": False,
     }
@@ -107,8 +107,23 @@ def test_the_classification_is_registered_on_the_profile(monkeypatch):
     verdict = provider.profile.classify_api_error
     assert verdict.__name__ == "classify_cursor_error"
     assert verdict(error_code="cursor_plan_only") == {
-        "reason": "format_error",
+        "reason": "incomplete_response",
         "retryable": False,
         "should_fallback": False,
     }
     assert verdict(status_code=429, message="out of usage") is None
+
+
+def test_the_reason_is_a_reason_the_host_actually_knows():
+    """An invented reason string makes the hook silently inert: the host drops it.
+
+    ``agent.error_classifier._profile_verdict`` coerces ``reason`` with
+    ``FailoverReason(reason)`` and returns None on ValueError, so a typo would leave the
+    failure exactly as retryable and fallback-eligible as before. Hermes is not a
+    dependency of this plugin, so this check is skipped where it cannot run.
+    """
+    host = pytest.importorskip("agent.error_classifier")
+    verdict = classify_cursor_error(error_code="cursor_plan_only")
+    reason = host.FailoverReason(verdict["reason"])
+    assert reason is host.FailoverReason.incomplete_response
+    assert reason not in host.RETRYABLE_CLIENT_REASONS
