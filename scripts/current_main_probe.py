@@ -82,6 +82,117 @@ def verify_managed_stream(profile) -> None:
         relay_runtime._reset_for_tests()
 
 
+def _usage_stub_agent():
+    """Minimal agent surface ``agent.turn_usage.record_response_usage`` reads."""
+    from types import SimpleNamespace
+
+    class Compressor:
+        threshold_tokens = 500_000
+
+        def __init__(self):
+            self.seen = []
+
+        def update_from_response(self, usage_dict):
+            self.seen.append(usage_dict)
+
+    return SimpleNamespace(
+        context_compressor=Compressor(),
+        model="grok-4.7", provider="cursor", api_mode="chat_completions",
+        base_url="https://api.cursor.com", api_key="offline-probe-token",
+        session_id="", quiet_mode=True, verbose_logging=False, log_prefix="",
+        platform="cli", _session_db=None, _session_db_created=True,
+        session_api_calls=0, session_prompt_tokens=0, session_completion_tokens=0,
+        session_total_tokens=0, session_input_tokens=0, session_output_tokens=0,
+        session_cache_read_tokens=0, session_cache_write_tokens=0,
+        session_reasoning_tokens=0, session_estimated_cost_usd=0.0,
+        session_cost_status=None, session_cost_source=None,
+        _last_turn_usage=None, _last_prompt_size_tokens=0,
+        _api_latency_history=[], _api_output_history=[],
+        _safe_print=lambda *a, **k: None, _vprint=lambda *a, **k: None,
+        _turn_route_task="",
+    )
+
+
+def verify_usage_seam(profile) -> None:
+    """Billed totals and the one-turn context anchor reach Hermes on separate fields."""
+    from types import SimpleNamespace
+    from agent.turn_usage import record_response_usage
+    from agent.relay_llm import _jsonable, _namespace
+
+    client = profile.create_client(api_key="offline-probe-token")
+    turns = [
+        SimpleNamespace(type="usage", usage=SimpleNamespace(
+            input_tokens=tokens, output_tokens=output,
+            cache_read_tokens=cached, cache_write_tokens=0))
+        for tokens, output, cached in ((240_000, 10, 3), (241_000, 10, 4), (242_000, 20, 5))
+    ]
+    result = SimpleNamespace(
+        result="ok", status="FINISHED", model=None,
+        usage=SimpleNamespace(input_tokens=723_000, output_tokens=40,
+                              cache_read_tokens=12, cache_write_tokens=0),
+    )
+
+    def stream():
+        yield from turns
+        yield SimpleNamespace(type="assistant", message=SimpleNamespace(
+            content=[SimpleNamespace(text="ok")]))
+
+    class Run:
+        def stream(self):
+            return stream()
+
+        def wait(self):
+            return result
+
+        def cancel(self):
+            pass
+
+    run = Run()
+    client._create_agent = lambda **kw: SimpleNamespace(
+        send=lambda message: run, close=lambda: None)
+    try:
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hello"}])
+        usage = response.usage
+        assert usage.prompt_tokens == 723_000, "billing lost the summed attempts"
+        assert usage.completion_tokens == 40
+        assert usage.prompt_tokens_details.cached_tokens == 12
+        assert usage.initial_prompt_tokens == 242_000, "anchor summed retry attempts"
+        assert usage.initial_cached_tokens == 5
+
+        chunks = list(client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hello"}], stream=True))
+        anchor = _namespace(_jsonable(chunks[-1].usage))
+        assert anchor.prompt_tokens == 723_000
+        assert anchor.initial_prompt_tokens == 242_000, "Relay normalization dropped the anchor"
+        assert anchor.initial_cached_tokens == 5
+
+        # Relay's recorded response is built from JSON-normalized chunk dicts, then read back
+        # as attributes; both steps must keep the separate context fields.
+        from agent.chat_completion_helpers_relay import RelayChatAccumulator
+
+        accumulator = RelayChatAccumulator()
+        for chunk in chunks:
+            accumulator.observe(_jsonable(chunk))
+        recorded = accumulator.finalize()["usage"]
+        assert recorded["prompt_tokens"] == 723_000
+        assert recorded["initial_prompt_tokens"] == 242_000
+        assert recorded["initial_cached_tokens"] == 5
+
+        agent = _usage_stub_agent()
+        record_response_usage(
+            agent, response, messages=[{"role": "user", "content": "hello"}],
+            api_call_count=1, api_duration=0.1, compression_attempts=0,
+            max_compression_attempts=3,
+        )
+        assert agent.session_prompt_tokens == 723_000, "session billing lost attempts"
+        assert agent.session_cache_read_tokens == 12
+        assert agent._last_turn_usage["prompt_tokens"] == 242_000, "context used billed total"
+        assert agent.context_compressor.seen[-1]["prompt_tokens"] == 242_000
+    finally:
+        client.close()
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="hermes-cursor-probe-") as raw_home:
         home = Path(raw_home)
@@ -189,10 +300,12 @@ def main() -> None:
         assert aux_client.HERMES_SKIP_ASYNC_WRAP
         aux_client.close()
         verify_managed_stream(profile)
+        verify_usage_seam(profile)
 
         print(json.dumps({
             "ok": True,
             "managed_relay_stream": True,
+            "usage_seam": True,
             "hermes_source": str(Path(providers.__file__).resolve()),
             "provider": runtime["provider"],
             "api_mode": runtime["api_mode"],

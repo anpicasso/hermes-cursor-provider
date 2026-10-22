@@ -33,12 +33,15 @@ UNOFFERED_CALL = CALL.replace('"name": "skill_view"', '"name": "shell_exec"')
 
 
 class OfflineRun:
-    def __init__(self, text, fragments=None):
+    def __init__(self, text, fragments=None, usages=()):
         self.text = text
         self.fragments = fragments if fragments is not None else [text]
+        self.usages = list(usages)
         self.cancelled = False
 
     def stream(self):
+        for usage in self.usages:
+            yield SimpleNamespace(type="usage", usage=usage)
         for text in self.fragments:
             if callable(text):
                 text = text()
@@ -46,11 +49,26 @@ class OfflineRun:
                 content=[SimpleNamespace(text=text)]))
 
     def wait(self):
-        return SimpleNamespace(result=self.text, status="FINISHED", usage=SimpleNamespace(
-            input_tokens=4, output_tokens=2), model=SimpleNamespace(id="auto"))
+        if self.usages:
+            usage = SimpleNamespace(
+                input_tokens=sum(item.input_tokens for item in self.usages),
+                output_tokens=sum(item.output_tokens for item in self.usages),
+                cache_read_tokens=sum(item.cache_read_tokens for item in self.usages),
+                cache_write_tokens=sum(item.cache_write_tokens for item in self.usages),
+            )
+        else:
+            usage = SimpleNamespace(input_tokens=4, output_tokens=2)
+        return SimpleNamespace(result=self.text, status="FINISHED", usage=usage,
+                               model=SimpleNamespace(id="auto"))
 
     def cancel(self):
         self.cancelled = True
+
+
+def turn_usage(tokens, *, output=0, cached=0, written=0):
+    """One per-turn ``usage`` event's numbers, as the Cursor SDK streams them."""
+    return SimpleNamespace(input_tokens=tokens, output_tokens=output,
+                           cache_read_tokens=cached, cache_write_tokens=written)
 
 
 class OfflineAgent:
@@ -355,6 +373,29 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(usage.total_tokens, 1506)
                 self.assertEqual(usage.prompt_tokens_details.cached_tokens, 30)
                 self.assertEqual(usage.prompt_tokens_details.cache_write_tokens, 20)
+
+    def test_usage_sums_attempts_but_keeps_the_peak_context_anchor(self):
+        """Three 240k/241k/242k-token prompts bill 723k; the context never exceeded 242k.
+
+        Hermes anchors compression on ``initial_prompt_tokens`` when the provider reports
+        it, so summing that field across discarded attempts would report a 723k context for
+        a session that fits its window — the regression this split exists to prevent.
+        """
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                self.sdk.runs.clear()
+                self.sdk.runs.extend([
+                    OfflineRun(ANNOUNCEMENT, usages=[turn_usage(240_000, output=10, cached=3)]),
+                    OfflineRun(ANNOUNCEMENT, usages=[turn_usage(241_000, output=10, cached=4)]),
+                    OfflineRun(CALL, usages=[turn_usage(242_000, output=20, cached=5)]),
+                ])
+                response = self.request(stream=streaming)
+                usage = list(response)[-1].usage if streaming else response.usage
+                self.assertEqual(usage.prompt_tokens, 723_000)
+                self.assertEqual(usage.completion_tokens, 40)
+                self.assertEqual(usage.prompt_tokens_details.cached_tokens, 12)
+                self.assertEqual(usage.initial_prompt_tokens, 242_000)
+                self.assertEqual(usage.initial_cached_tokens, 5)
 
     def test_no_tools_disabled_tools_and_title_requests_do_not_recover(self):
         for tools, choice in ((None, None), ([], "required"), (TOOLS, "none")):

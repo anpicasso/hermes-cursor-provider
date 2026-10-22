@@ -1464,22 +1464,24 @@ def _usage_of(tokens, *, output=0, cached=0, written=0):
     )
 
 
-def test_reported_prompt_tokens_is_one_turn_not_the_run_total():
-    """Hermes reads ``usage.prompt_tokens`` as the size of the request it just sent.
+def test_billed_totals_stay_billed_while_the_context_anchor_is_one_turn():
+    """Hermes needs both numbers: the SDK's billed run total and one prompt's size.
 
-    It anchors compression and the session budget on that number, so the adapter must
-    report one prompt — not the run total the Cursor SDK hands back in ``result.usage``.
+    ``usage.prompt_tokens`` feeds session totals and cost, so it must stay the sum the SDK
+    reports (598,980 across two ~241k-token turns). ``usage.initial_prompt_tokens`` is the
+    separate context size Hermes anchors compression on, so it must be a single turn — the
+    run total would place a session above its own window and fail every later turn closed.
     """
     client = CursorSDKClient(api_key="crsr_test")
     try:
         sdk = client._sdk_client()
         sdk.result.result = "done"
-        sdk.result.usage = _usage_of(598_980)
+        sdk.result.usage = _usage_of(598_980, output=1_000, cached=500, written=60)
         _scripted_run(
             sdk,
             [
-                SimpleNamespace(type="usage", usage=_usage_of(240_000)),
-                SimpleNamespace(type="usage", usage=_usage_of(241_305)),
+                SimpleNamespace(type="usage", usage=_usage_of(240_000, cached=200)),
+                SimpleNamespace(type="usage", usage=_usage_of(241_305, cached=250)),
                 _assistant_event("done"),
             ],
         )
@@ -1488,9 +1490,15 @@ def test_reported_prompt_tokens_is_one_turn_not_the_run_total():
         )
     finally:
         client.close()
-    assert response.usage.prompt_tokens == 241_305, (
-        "reported the run's cumulative input instead of a single turn's prompt"
+    usage = response.usage
+    assert usage.prompt_tokens == 598_980, "billing lost the SDK's summed input"
+    assert usage.completion_tokens == 1_000, "billing lost the SDK's summed output"
+    assert usage.prompt_tokens_details.cached_tokens == 500
+    assert usage.prompt_tokens_details.cache_write_tokens == 60
+    assert usage.initial_prompt_tokens == 241_305, (
+        "context anchor is not a single turn's prompt"
     )
+    assert usage.initial_cached_tokens == 250, "context anchor lost that turn's cache read"
 
 
 def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
@@ -1518,13 +1526,13 @@ def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
         )
     finally:
         client.close()
-    assert response.usage.prompt_tokens == 13_778, (
+    assert response.usage.initial_prompt_tokens == 13_778, (
         "a smaller later turn overwrote the peak prompt reading"
     )
 
 
 def test_no_usage_event_falls_back_to_the_run_result():
-    """A runtime that emits no per-turn event must keep reporting its result usage."""
+    """A runtime that emits no per-turn event keeps its billed usage and no anchor."""
     client = CursorSDKClient(api_key="crsr_test")
     try:
         sdk = client._sdk_client()
@@ -1537,10 +1545,13 @@ def test_no_usage_event_falls_back_to_the_run_result():
     finally:
         client.close()
     assert response.usage.prompt_tokens == 1234
+    assert not hasattr(response.usage, "initial_prompt_tokens"), (
+        "invented a context anchor with no per-turn evidence"
+    )
 
 
-def test_streaming_path_reports_the_peak_turn_usage():
-    """The streaming builder reads the same swapped result, so its final chunk agrees."""
+def test_streaming_path_reports_billed_totals_and_the_context_anchor():
+    """Streamed/Relay chunks read the same result, so the final chunk carries both fields."""
     client = CursorSDKClient(api_key="crsr_test")
     try:
         sdk = client._sdk_client()
@@ -1563,12 +1574,34 @@ def test_streaming_path_reports_the_peak_turn_usage():
         client.close()
     final = [chunk for chunk in chunks if getattr(chunk, "usage", None)]
     assert final, "no usage-bearing chunk was emitted"
-    assert final[-1].usage.prompt_tokens == 180_000
+    assert final[-1].usage.prompt_tokens == 300_000
+    assert final[-1].usage.initial_prompt_tokens == 180_000
 
 
-def test_a_result_that_cannot_be_swapped_keeps_its_own_usage():
-    """``replace()`` needs a dataclass; an object that refuses it must not fail the turn."""
-    opaque = SimpleNamespace(usage=_usage_of(4242))
-    swapped = client_module._with_peak_turn_usage(opaque, _usage_of(77))
-    assert swapped is opaque
-    assert swapped.usage.input_tokens == 4242
+def test_retry_aggregation_sums_billing_but_not_the_context_anchor():
+    """Three 240k/241k/242k-prompt attempts bill 723k; the context never exceeded 242k.
+
+    Summing the anchor too is what made Hermes report 723k for a session that fit its
+    window, so aggregation has to keep the peak while still adding up real spend.
+    """
+    attempts = [
+        (
+            SimpleNamespace(
+                model=None,
+                usage=_usage_of(prompt, output=output, cached=cached, written=written),
+            ),
+            _usage_of(prompt, output=output, cached=cached, written=written),
+        )
+        for prompt, output, cached, written in (
+            (240_000, 10, 3, 1),
+            (241_000, 10, 4, 2),
+            (242_000, 20, 5, 3),
+        )
+    ]
+    result = client_module._aggregate_result(attempts)
+    assert result.usage.input_tokens == 723_000
+    assert result.usage.output_tokens == 40
+    assert result.usage.cache_read_tokens == 12
+    assert result.usage.cache_write_tokens == 6
+    assert result.initial_prompt_tokens == 242_000
+    assert result.initial_cached_tokens == 5

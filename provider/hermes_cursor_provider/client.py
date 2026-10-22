@@ -17,7 +17,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
@@ -451,12 +451,32 @@ def extract_tool_calls(text: str, allowed_names: set[str]) -> tuple[list[Any], s
     return parser.calls, parser.text
 
 
+def _token_count(usage: Any, name: str) -> int:
+    """One integer token bucket of a usage record, or 0 when it is absent/unreadable."""
+    try:
+        return int(getattr(usage, name, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prompt_size(usage: Any) -> int:
+    """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
+    return _token_count(usage, "input_tokens")
+
+
 def _usage(result: Any) -> Any:
     usage = getattr(result, "usage", None)
-    prompt = int(getattr(usage, "input_tokens", 0) or 0)
-    completion = int(getattr(usage, "output_tokens", 0) or 0)
-    cached = int(getattr(usage, "cache_read_tokens", 0) or 0)
-    written = int(getattr(usage, "cache_write_tokens", 0) or 0)
+    prompt = _token_count(usage, "input_tokens")
+    completion = _token_count(usage, "output_tokens")
+    cached = _token_count(usage, "cache_read_tokens")
+    written = _token_count(usage, "cache_write_tokens")
+    # ``prompt_tokens`` and friends stay the SDK's billed totals (summed over every turn and
+    # retry); ``initial_*`` is the separate one-turn context anchor Hermes reads.
+    anchor = {
+        name: getattr(result, name)
+        for name in ("initial_prompt_tokens", "initial_cached_tokens")
+        if isinstance(getattr(result, name, None), int)
+    }
     return SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
@@ -465,58 +485,53 @@ def _usage(result: Any) -> Any:
             cached_tokens=cached,
             cache_write_tokens=written,
         ),
+        **anchor,
     )
 
 
-def _prompt_size(usage: Any) -> int:
-    """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
-    try:
-        return int(getattr(usage, "input_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
+def _context_fields(turn_usage: Any) -> dict[str, int]:
+    """Hermes' context-size anchor: ONE turn's prompt, separate from billed totals.
 
+    Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage`` hold a
+    ``TokenUsage`` "summed across every turn that reported usage", while the ``usage`` stream
+    event carries one turn's own numbers. Hermes reads ``usage.prompt_tokens`` as billed input
+    (session totals, cost) but ``usage.initial_prompt_tokens`` — when present — as the size of
+    the request it just sent, which anchors compression and the session budget. Reporting the
+    run sum in that slot inflated a session by its turn count: one observed run reported
+    598,980 for a ~241,305-token prompt, anchored a 33-message session above its 500,000
+    window, and failed every later turn closed as "too large to compress further".
 
-def _with_peak_turn_usage(result: Any, turn_usage: Any) -> Any:
-    """Report the run's LARGEST per-turn usage instead of the SDK's run-wide sum.
+    The PEAK, not the last: a run that reports several turns need not finish with its largest
+    prompt (one live thread measured 14,191 then 8,686 on consecutive calls), and understating
+    the context is the direction that lets a session overflow before compression fires.
 
-    Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage``
-    hold a ``TokenUsage`` "summed across every turn that reported usage", while the
-    ``usage`` stream event carries one turn's own numbers. Hermes reads
-    ``usage.prompt_tokens`` as the size of the request it just sent — it is the
-    compression anchor (``agent/usage_anchor.py``: "the provider's real
-    ``usage.prompt_tokens`` is the only authoritative context size") and the input to a
-    session budget. Reporting the run total therefore inflates the session by the number
-    of turns the run took: one observed run reported 598,980 for a ~241,305-token prompt,
-    which anchored a 33-message session above its 500,000 window so every later turn
-    failed closed as "too large to compress further" — the transcript held ~16k tokens,
-    so no compression pass could ever help.
-
-    The PEAK, not the last: a run that reports several turns need not finish with its
-    largest prompt (one live thread measured 14,191 then 8,686 on consecutive calls), so
-    "whatever arrived last" can understate the context — the direction that lets a
-    session overflow before compression fires. The peak stays inside the documented
-    contract (one turn's numbers) and can never exceed a single turn, so the sum can
-    never come back.
-
-    Degrades to the result's own usage when no per-turn event was seen or the result
-    refuses the swap; a missing number must never fail a run.
+    ``initial_cached_tokens`` is capped at the anchor because Hermes subtracts it from the
+    prompt; a cache reading larger than the prompt would make the context input bucket negative.
     """
-    if turn_usage is None:
-        return result
-    try:
-        return replace(result, usage=turn_usage)
-    except Exception:  # noqa: BLE001 - diagnostics must not fail a turn
-        return result
+    prompt = _prompt_size(turn_usage)
+    if prompt <= 0:
+        return {}
+    cached = _token_count(turn_usage, "cache_read_tokens")
+    return {
+        "initial_prompt_tokens": prompt,
+        "initial_cached_tokens": min(max(cached, 0), prompt),
+    }
 
 
-def _aggregate_result(attempts: list[Any]) -> Any:
-    """Sum billed usage across discarded recovery attempts, keeping the final model."""
-    result = attempts[-1]
-    if len(attempts) == 1:
-        return result
+def _aggregate_result(attempts: list[tuple[Any, Any]]) -> Any:
+    """Sum billed usage across discarded recovery attempts, keeping the final model.
+
+    Billing really is spent on every attempt, so input/output/cache tokens add up. The
+    context anchor must not: it describes one prompt, and summing 240k+241k+242k would report
+    723k for a session that never exceeded 242k — the failure the anchor exists to prevent.
+    """
+    result, _ = attempts[-1]
+    anchor = max(
+        (item for _, item in attempts if item is not None), key=_prompt_size, default=None
+    )
 
     def total(name: str) -> int:
-        return sum(int(getattr(getattr(item, "usage", None), name, 0) or 0) for item in attempts)
+        return sum(_token_count(getattr(item, "usage", None), name) for item, _ in attempts)
 
     return SimpleNamespace(
         model=getattr(result, "model", None),
@@ -526,6 +541,7 @@ def _aggregate_result(attempts: list[Any]) -> Any:
             cache_read_tokens=total("cache_read_tokens"),
             cache_write_tokens=total("cache_write_tokens"),
         ),
+        **_context_fields(anchor),
     )
 
 
@@ -1213,14 +1229,18 @@ class CursorSDKClient:
         allowed_names: set[str],
         native: dict[str, Any],
     ) -> Any:
-        """Stream one SDK run into ``parser``; returns (result, streamed, failure, stopped)."""
+        """Stream one SDK run into ``parser``; returns (result, streamed, failure, stopped, peak).
+
+        ``result.usage`` is left as the SDK's billed total; ``peak`` is this run's largest
+        per-turn usage, which becomes the separate context anchor (see ``_context_fields``).
+        """
         intercept = _flag("HERMES_CURSOR_INTERCEPT_NATIVE", True)
         streamed = ""
         failure = ""
         stopped = False
         stopping = False
         # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
-        # run-wide sum, so it can never stand in for one prompt (see _with_peak_turn_usage).
+        # run-wide sum, so it can never stand in for one prompt (see _context_fields).
         peak_usage: Any = None
         stream = getattr(run, "stream", None)
         if callable(stream):
@@ -1317,11 +1337,11 @@ class CursorSDKClient:
             with suppress(Exception):
                 run.cancel()
             result = SimpleNamespace(result="", usage=None, model=None, status="INTERCEPTED")
-            return result, streamed, "", True
+            return result, streamed, "", True, peak_usage
         result = run.wait()
-        # Prefer this run's peak per-turn usage over the SDK's run-wide sum.
-        result = _with_peak_turn_usage(result, peak_usage)
-        return result, streamed, failure, False
+        # ``result.usage`` stays the SDK's billed total; the peak turn rides alongside so the
+        # response can expose it as Hermes' separate context anchor.
+        return result, streamed, failure, False, peak_usage
 
     def _run_agent(
         self,
@@ -1344,7 +1364,9 @@ class CursorSDKClient:
         """
         require_call = bool(allowed_names) and require_call
         info = info if info is not None else {}
-        attempts: list[Any] = []
+        # Each attempt carries (result, its peak per-turn usage) so billed totals can be summed
+        # without summing the one-turn context anchor.
+        attempts: list[tuple[Any, Any]] = []
         budget: int | None = None
         fail_on_exhaustion = False
         for attempt in range(3):
@@ -1361,8 +1383,8 @@ class CursorSDKClient:
                     try:
                         event = next(execution)
                     except StopIteration as stop:
-                        result, calls, content = stop.value
-                        attempts.append(result)
+                        result, calls, content, context_usage = stop.value
+                        attempts.append((result, context_usage))
                         break
                     if holding:
                         held.append(event)
@@ -1451,8 +1473,10 @@ class CursorSDKClient:
         attempt's native_misses / misses / intercepted / rejected so ``_run_agent`` can make
         one shared, bounded recovery decision; no retry happens here.
 
-        Returns (result, calls, content) — the extraction the buffered path used,
-        produced incrementally so callers see text before the SDK run completes."""
+        Returns (result, calls, content, context_usage) — the extraction the buffered path
+        used, produced incrementally so callers see text before the SDK run completes.
+        ``context_usage`` is this run's peak per-turn usage (or None); ``result.usage`` keeps
+        the SDK's billed run total."""
         parser = _ToolBlockStream(allowed_names)
         native: dict[str, Any] = {"ids": set(), "pending": {}, "intercepted": [], "misses": []}
         info = info if info is not None else {}
@@ -1466,7 +1490,7 @@ class CursorSDKClient:
                 if control.closed or self.is_closed:
                     raise CursorSDKRunError("Cursor stream cancelled during startup")
             try:
-                result, streamed, failure, stopped = yield from self._consume(
+                result, streamed, failure, stopped, context_usage = yield from self._consume(
                     run, parser, allowed_names, native
                 )
             finally:
@@ -1485,7 +1509,7 @@ class CursorSDKClient:
             info["misses"] = list(native["misses"])
             info["intercepted"] = len(native["intercepted"])
             info["rejected"] = parser.rejected
-            return result, parser.calls, parser.text
+            return result, parser.calls, parser.text, context_usage
         except BaseException:
             if run is not None:
                 with suppress(Exception):
