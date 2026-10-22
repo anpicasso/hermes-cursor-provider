@@ -93,3 +93,29 @@ def test_a_raised_code_reaches_the_host_without_the_caller_supplying_a_body(
 def test_the_exception_body_carries_the_code_in_the_shape_the_host_reads(tree_profile):
     exc = _error("forced failure", status_code=400, error_code="cursor_plan_only")
     assert exc.body["error"]["code"] == "cursor_plan_only"
+
+
+@pytest.mark.parametrize("code", ["cursor_plan_only", "cursor_invalid_params"])
+def test_the_verdict_survives_when_the_body_is_absent(tree_profile, code):
+    """The attribute layer is the belt to the body's braces: pin it, or it can rot unnoticed."""
+    exc = _error("forced failure", status_code=400, error_code=code)
+    exc.body = None
+    verdict = classify_api_error(exc, provider="cursor", model="grok-4.7")
+    assert verdict.retryable is False
+    assert verdict.should_fallback is False
+
+
+def test_a_malformed_parameter_string_is_terminal_not_a_local_bug(tree_profile):
+    """``grok-4.7@xhigh`` is a configuration typo, not a bug to retry on another provider.
+
+    ``_split_model`` rejects it before the bridge exists with a plain ValueError. The host treats
+    ValueErrors as local validation bugs and falls back — a silent wrong-model answer — unless the
+    profile hook recognises its own text and opts out.
+    """
+    client_module = sys.modules[f"{_MODULE}.hermes_cursor_provider.client"]
+    with pytest.raises(ValueError) as excinfo:
+        client_module._split_model("grok-4.7@xhigh")
+    verdict = classify_api_error(excinfo.value, provider="cursor", model="grok-4.7")
+    assert verdict.reason == FailoverReason.format_error
+    assert verdict.retryable is False
+    assert verdict.should_fallback is False

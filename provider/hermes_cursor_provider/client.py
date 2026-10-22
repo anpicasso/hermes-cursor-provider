@@ -177,12 +177,9 @@ def classify_cursor_error(
     # The host derives ``error_code`` from the response BODY and passes that kwarg through; our own
     # raises carry the code on the exception and in its body. Read all three, so a raise that forgets
     # one of them still classifies instead of silently falling back.
-    code = str(
-        error_code
-        or getattr(error, "error_code", "")
-        or (((getattr(error, "body", None) or body or {}).get("error") or {}).get("code"))
-        or ""
-    ).strip().lower()
+    _body = getattr(error, "body", None) or body
+    _nested = ((_body.get("error") or {}).get("code")) if isinstance(_body, dict) else ""
+    code = str(error_code or getattr(error, "error_code", "") or _nested or "").strip().lower()
     # Two different failures, two different reasons. A plan-only exhaustion is not a malformed
     # request: the model announced an action, was nudged twice, and never produced a call --
     # ``incomplete_response`` says exactly that, and ``format_error`` would tell the user to
@@ -194,6 +191,15 @@ def classify_cursor_error(
     }
     reason = reasons.get(code)
     if reason is None:
+        # A THIRD raise site carries no code: ``_split_model`` rejects a malformed
+        # ``id@key=value`` string before the bridge exists, with a plain ValueError whose text
+        # names our own parser. The host treats ValueErrors as local validation bugs and answers
+        # with another provider — a silent wrong-model reply to a configuration typo. Recognise our
+        # own text; the host honours a verdict that opts out even for a ValueError subclass.
+        first_arg = getattr(error, "args", ())
+        text = str(first_arg[0]) if first_arg else ""
+        if text.startswith("Cursor model parameters"):
+            return {"reason": "format_error", "retryable": False, "should_fallback": False}
         return None
     return {"reason": reason, "retryable": False, "should_fallback": False}
 
