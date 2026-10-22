@@ -406,7 +406,9 @@ def test_model_listing_without_sdk_logs_warning_and_returns_empty(monkeypatch, c
     assert "not importable" in caplog.text
 
 
-def test_missing_key_and_foreign_base_url_fail_before_launch():
+def test_missing_key_and_foreign_base_url_fail_before_launch(monkeypatch):
+    # A user-scoped turn must fail closed, not quietly borrow the process account.
+    monkeypatch.setenv("CURSOR_API_KEY", "env-wrong-account")
     foreign = CursorSDKClient(api_key="secret", base_url="https://example.com")
     with pytest.raises(ValueError):
         foreign.chat.completions.create(model="auto", messages=[])
@@ -418,6 +420,20 @@ def test_missing_key_and_foreign_base_url_fail_before_launch():
     finally:
         client.close()
     assert FakeCursorClient.launches == []
+
+
+def test_explicit_key_wins_over_the_process_cursor_api_key(monkeypatch):
+    monkeypatch.setenv("CURSOR_API_KEY", "env-wrong-account")
+    client = CursorSDKClient(api_key="crsr_scoped")
+    try:
+        client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.options[0]["api_key"] == "crsr_scoped"
+    assert FakeCursorClient.launches[0]["allow_api_key_env_fallback"] is True
 
 
 def test_session_reuses_agent_across_facades_and_sends_only_delta():
@@ -1605,3 +1621,102 @@ def test_retry_aggregation_sums_billing_but_not_the_context_anchor():
     assert result.usage.cache_write_tokens == 6
     assert result.initial_prompt_tokens == 242_000
     assert result.initial_cached_tokens == 5
+
+
+
+def test_run_client_keeps_the_sdk_native_unary_bound(monkeypatch):
+    """The run deadline must not stretch the SDK's own 30 s unary timeout."""
+    monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 1800.0)
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.timeout_options["unary_timeout"] == 30.0
+
+
+def test_run_timeout_env_parsing(monkeypatch):
+    """The cap reads the environment, falls back on junk, and cannot be switched off."""
+    monkeypatch.delenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", raising=False)
+    assert client_module._run_timeout_seconds() == 1800.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "45")
+    assert client_module._run_timeout_seconds() == 45.0
+    for junk in ("abc", "0", "-5", "", "nan", "inf", "-inf", "1e999"):
+        monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", junk)
+        assert client_module._run_timeout_seconds() == 1800.0, junk
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "999999")
+    assert client_module._run_timeout_seconds() == 86400.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "0.001")
+    assert client_module._run_timeout_seconds() == 0.05
+
+
+def test_a_stalled_result_wait_times_out_instead_of_hanging(monkeypatch):
+    """``run.wait()`` never gives up on its own; a stalled run must fail the turn."""
+    monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 0.05)
+
+    class SlowWaitRun(FakeRun):
+        def wait(self):
+            time.sleep(0.5)
+            return super().wait()
+
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "never arrives"
+        run = SlowWaitRun(sdk.result)
+        agent = FakeAgent(sdk)
+        agent.send = lambda message: run
+        sdk.create_agent = lambda options: agent
+        with pytest.raises(client_module.CursorSDKRunError) as excinfo:
+            client.chat.completions.create(
+                model="auto", messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        client.close()
+    assert excinfo.value.status_code == 408
+    assert excinfo.value.error_code == "cursor_run_timeout"
+    assert run.cancelled, "the stalled run was left running"
+
+
+def test_a_completed_run_is_not_cancelled():
+    """The deadline must not cancel a run that finished on its own."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "hello"
+        run = ScriptedRun(sdk.result, [_assistant_event("hello")])
+        agent = FakeAgent(sdk)
+        agent.send = lambda message: run
+        sdk.create_agent = lambda options: agent
+        response = client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    assert response.choices[0].message.content == "hello"
+    assert not run.cancelled, "a completed run was cancelled by the deadline path"
+
+
+def test_a_wait_failure_is_not_reported_as_our_timeout():
+    """A genuine SDK failure must surface as itself, not as our 408."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        sdk = client._sdk_client()
+        sdk.result.result = "ignored"
+        run = FailingRun(sdk.result)
+        agent = FakeAgent(sdk)
+        agent.send = lambda message: run
+        sdk.create_agent = lambda options: agent
+        with pytest.raises(Exception) as excinfo:
+            client.chat.completions.create(
+                model="auto", messages=[{"role": "user", "content": "hi"}]
+            )
+    finally:
+        client.close()
+    assert not (
+        isinstance(excinfo.value, client_module.CursorSDKRunError)
+        and excinfo.value.error_code == "cursor_run_timeout"
+    ), "an SDK failure was reported as our timeout"
