@@ -1328,12 +1328,16 @@ def test_parameter_selection_reaches_sdk_for_async_and_stream():
 def test_unsupported_parameters_fail_closed_before_agent_creation(model, message):
     client = CursorSDKClient(api_key="crsr_test")
     try:
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(client_module.CursorSDKRunError, match=message) as excinfo:
             client.chat.completions.create(
                 model=model, messages=[{"role": "user", "content": "hi"}]
             )
     finally:
         client.close()
+    # Terminal, not a local validation bug: the host falls back for ValueError, and a fallback
+    # answers a bad-parameter turn from a different provider.
+    assert excinfo.value.error_code == "cursor_invalid_params"
+    assert excinfo.value.status_code == 400
     assert FakeCursorClient.instances[0].options == []
     assert FakeCursorClient.instances[0].agents == []
 

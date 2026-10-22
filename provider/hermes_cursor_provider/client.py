@@ -1454,7 +1454,15 @@ class CursorSDKClient:
                 selected_model["id"], selected_model["params"], catalog
             )
             if error:
-                raise ValueError(error)
+                # A rejected @parameter is a permanent configuration failure, and it is raised
+                # BEFORE any run. A bare ValueError here reads to the host as a local validation
+                # bug (``_is_local_validation_error`` -> unclassified -> fallback chain), so the
+                # turn would be answered by another provider without saying so — the exact
+                # failure this code exists to prevent. CursorSDKRunError is a RuntimeError, so the
+                # host takes the classified path and our verdict stops the fallback.
+                raise CursorSDKRunError(
+                    error, status_code=400, error_code="cursor_invalid_params"
+                )
         if selected_model:
             options["model"] = selected_model
         return setup_client.create_agent(options)
