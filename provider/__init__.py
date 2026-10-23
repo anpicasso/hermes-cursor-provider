@@ -7,7 +7,7 @@ from typing import Any
 from providers import register_provider
 from providers.base import ProviderProfile
 
-from .hermes_cursor_provider.client import CURSOR_API_URL, _context_window
+from .hermes_cursor_provider.client import CURSOR_API_URL, classify_cursor_error, _context_window
 
 _log = logging.getLogger(__name__)
 _SEED_MODELS = ("auto", "composer-2.5")
@@ -80,5 +80,8 @@ profile = CursorProfile(
     },
     default_aux_model="auto",
     unsupported_response_formats=("json_schema", "json_object"),
+    # Constructor kwarg, never a method: the dataclass field default would shadow a
+    # same-named method in the generated __init__.
+    classify_api_error=classify_cursor_error,
 )
 register_provider(profile)
