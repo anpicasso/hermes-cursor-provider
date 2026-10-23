@@ -178,7 +178,11 @@ def classify_cursor_error(
     # raises carry the code on the exception and in its body. Read all three, so a raise that forgets
     # one of them still classifies instead of silently falling back.
     _body = getattr(error, "body", None) or body
-    _nested = ((_body.get("error") or {}).get("code")) if isinstance(_body, dict) else ""
+    # A dict-shaped body carries the code, but a provider that returns ``{"error": "text"}`` must not
+    # blow up inside the hook: check the inner value too. The host swallows a hook exception and
+    # declines, so the damage would be a missed classification, not a misroute — a guard is cheaper.
+    _inner = _body.get("error") if isinstance(_body, dict) else None
+    _nested = _inner.get("code") if isinstance(_inner, dict) else ""
     code = str(error_code or getattr(error, "error_code", "") or _nested or "").strip().lower()
     # Two different failures, two different reasons. A plan-only exhaustion is not a malformed
     # request: the model announced an action, was nudged twice, and never produced a call --
