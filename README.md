@@ -13,7 +13,26 @@ It uses Cursor's official [`cursor-sdk`](https://cursor.com/docs/sdk/python) pac
 - Disables Cursor built-in tools and MCP servers, gives each SDK agent a private working directory, and accepts only tool names offered by Hermes.
 - Returns OpenAI-shaped sync/async responses so Hermes retains its normal conversation, approval, and tool loop.
 
-Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools are not used because they would execute outside Hermes' approval path.
+Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools stay off unless `HERMES_CURSOR_NATIVE_TOOLS` is set or the model name says `native_tools=on`; see [Native tools (opt-in)](#native-tools-opt-in).
+
+## Native tools (opt-in)
+
+Offer Hermes's tool list as Cursor custom tools on the stream path in either of two ways. The model name wins over the environment in both directions.
+
+- Model parameter: append `native_tools=on` or `native_tools=off` to the `id@key=value,…` suffix, for example `grok-4.7@context=500k,reasoning_effort=xhigh,fast=true,native_tools=on` or `grok-4.7@native_tools=on`. `native_tools` is plugin-only and is not sent to Cursor. A model whose only parameter is `native_tools` selects the bare id. Any other value is an error. Switching it with `/model` starts a different retained session.
+- Environment: `HERMES_CURSOR_NATIVE_TOOLS=1` turns it on when the model name does not say. `=0` or unset leaves it off unless the name says `native_tools=on`.
+
+They ride the SDK `mcp` capability group (`tools: ["mcp"]`). No MCP servers are loaded: `mcp_servers` stays empty and `setting_sources` is not set, so the only tools are the ones Hermes offered. The executor is inert. Hermes still decides and runs every tool after the turn; the model must not invent a result.
+
+`HERMES_CURSOR_NATIVE_MAX_CALLS` caps accepted calls in one run (default 64, clamped 1–1024). A non-stream request (streaming off, or Hermes's one-off 5xx retry) stays on the upstream text protocol even when the name says `native_tools=on`. The first such request in a native session re-sends the full transcript, and the next stream request re-sends it again. In a measured comparison the native arm took about twice the wall time and more tool rounds than the text protocol. A native run is cancelled when Cursor starts a second answer; the session agent is retired and the next turn re-sends the full transcript, and usage is the sum of turns up to the cut, so Cursor's dashboard can show slightly more than Hermes reports.
+
+This host runs one gateway that serves every profile (`gateway.multiplex_profiles`, default on). Under that gateway:
+
+1. A named profile's own `.env` does not reach the plugin, so use the model parameter there.
+2. The env form in the launch (default) `.env` turns native mode on for every profile that gateway serves.
+3. To pick a `…,native_tools=on` name with `/model`, list it in the launch `.env`'s `HERMES_CURSOR_MODEL_VARIANTS`. CLI `--model` and a config model string are not catalog-checked.
+
+Rollback: remove `native_tools=on|off` from every model name (and from `HERMES_CURSOR_MODEL_VARIANTS`) first. Unsetting `HERMES_CURSOR_NATIVE_TOOLS` only covers the env form.
 
 ## Install
 
@@ -51,7 +70,7 @@ Without a suffix, Cursor picks the model's default variant. Parameter ids and va
 
 Hermes' `/reasoning` and `delegation.reasoning_effort` settings are **not** mapped onto Cursor parameters automatically. Select the model's own parameter explicitly with the `@key=value` suffix (for example `grok-4.7@reasoning_effort=xhigh`).
 
-Hermes' `/model` command only accepts names from the provider's model listing. To make chosen variants selectable there, list them in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) in the profile's `.env`:
+Hermes' `/model` command only accepts names from the provider's model listing. To make chosen variants selectable there, list them in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) in the launch (default) profile's `.env`. Under a multiplexing gateway a named profile's own `.env` does not reach the plugin:
 
 ```bash
 HERMES_CURSOR_MODEL_VARIANTS=grok-4.7@context=500k,reasoning_effort=xhigh,fast=true
@@ -79,7 +98,7 @@ If `hermes model` lists only `auto` and `composer-2.5`, the account model list d
 - One SDK-owned loopback bridge is shared per Hermes profile process and closed at process exit.
 - Run-scoped `CancelRun`/`WaitLiveRun` use the SDK's local-bridge opt-in because the SDK guards them as cloud calls and its client exposes no per-call key for them. The scoped account key is still sent explicitly on `CreateAgent`, `ListModels`, and `Send`, and an empty scoped key fails before bridge launch, so a process `CURSOR_API_KEY` is never used for a user-scoped turn.
 - Every retained SDK agent gets a private working directory. Sessions are isolated by Hermes profile, conversation, account-key digest, and model.
-- Cursor built-in tools and MCP servers are disabled. Hermes executes only allowlisted tool names through its own loop.
+- Cursor built-in tools stay disabled, and no MCP servers are loaded. Custom tools stay off unless native tools are enabled; even then the executor is inert and Hermes runs every call. Hermes executes only allowlisted tool names through its own loop.
 - Only HTTPS or bounded `data:image/*;base64` image inputs are forwarded.
 
 See [SECURITY.md](SECURITY.md) for reporting and residual risks.
@@ -88,10 +107,10 @@ See [SECURITY.md](SECURITY.md) for reporting and residual risks.
 
 - Cursor SDK `1.x` is proprietary beta software and may change; the plugin pins the supported major version.
 - Model parameters are explicit only: Hermes' `/reasoning` and `delegation.reasoning_effort` settings are not mapped automatically onto Cursor's `reasoning_effort`/`effort` parameters.
-- The plugin does not request Cursor's optional local sandbox because the SDK rejects it on unsupported hosts. Security does not depend on that sandbox: Cursor built-in tools, custom tools, and MCP servers remain disabled, and Hermes owns tool execution.
+- The plugin does not request Cursor's optional local sandbox because the SDK rejects it on unsupported hosts. Security does not depend on that sandbox: Cursor built-in tools stay disabled and no MCP servers are loaded. Custom tools stay off unless native tools are enabled; even then the executor is inert and Hermes runs every call.
 - Text streams incrementally from the SDK to Hermes, including managed Relay and async auxiliary consumers. Incomplete tool-call blocks, trailing whitespace, and a possible short action-only announcement are held back. Required/named tool-choice responses and corrective attempts are held until a validated call arrives; ordinary text still streams incrementally. Usage and the finish marker arrive when the SDK run ends. A terminal-only SDK response cannot provide earlier text.
 - A short, unconditional action announcement with no validated call triggers at most two corrective nudges, as does an unsatisfied required/named tool choice when tools are available. Failed preliminary text is not returned as a completed answer or saved in Hermes session history. Exhaustion raises `CursorSDKRunError`; the adapter never infers or executes a tool. Questions, conditional offers, ordinary answers, and requests without enabled tools are not retried. See `docs/recovery-tdd.md` for offline verification and scope.
-- Tool calls use a prompt-level contract because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop. Offered Hermes calls emitted on the native channel are intercepted and returned to Hermes; Cursor-native execution remains disabled.
+- Tool calls use a prompt-level contract unless native tools are enabled, because the official SDK's custom-tool callbacks execute inside the SDK run rather than Hermes' normal approval loop and are not used as an executor. Custom tools stay off unless native tools are enabled; even then the executor is inert and Hermes runs every call. Offered Hermes calls emitted on the native channel are intercepted and returned to Hermes; Cursor-native execution remains disabled.
 - Up to 16 idle conversation agents are retained per process by default (`HERMES_CURSOR_MAX_SESSIONS` changes the LRU target); active turns can temporarily exceed it. A history rewrite/compaction starts a fresh agent; concurrent turns on one conversation use an isolated one-shot agent.
 - Agent reuse ends on process restart. Cross-process SDK resume is deliberately not enabled yet.
 - Cursor cache reads and writes are reported through Hermes usage metadata; Cursor's billed `Agent.get_usage()` endpoint may remain unavailable for some accounts.
