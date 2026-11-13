@@ -138,12 +138,87 @@ class CursorSDKRunError(RuntimeError):
         *,
         status_code: int | None = None,
         error_code: str | None = None,
+        body: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         lowered = message.lower()
         default_status = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
         self.status_code = status_code if status_code is not None else default_status
         self.error_code = error_code or "cursor_sdk_run_failed"
+        # The host classifier reads the code off the parsed BODY — ``_body_of(exc)`` then an
+        # ``_extract_error_code`` over ``error.code`` — before it calls this profile's hook. An
+        # exception that carried the code as an attribute alone was invisible to it, so every
+        # "terminal" verdict silently declined and the host fell back to another provider. Attach
+        # the body so the code travels the way the host reads it.
+        self.body = body if body is not None else {
+            "error": {"code": self.error_code, "message": message}
+        }
+
+
+def classify_cursor_error(
+    error: Any = None,
+    *,
+    status_code: int | None = None,
+    error_code: str = "",
+    message: str = "",
+    body: dict | None = None,
+    model: str = "",
+) -> dict[str, Any] | None:
+    """Terminal verdict for the plugin's fail-closed raises, and nothing else.
+
+    Runs for every Cursor failure before the status and message paths. Returning a
+    verdict for anything else would make a 429 usage limit non-retryable and
+    non-fallback, disabling credential rotation and the host's provider fallback for
+    all of them. Decline unless the structured code proves this is one of our own
+    raises: a model that announced a tool call and produced none, or a Cursor-rejected
+    model parameter. Falling back to a different model in either case answers with a
+    different model and never says so, which is the failure this classification prevents.
+    """
+    # The host derives ``error_code`` from the response BODY and passes that kwarg through; our own
+    # raises carry the code on the exception and in its body. Read all three, so a raise that forgets
+    # one of them still classifies instead of silently falling back.
+    _body = getattr(error, "body", None) or body
+    # A dict-shaped body carries the code, but a provider that returns ``{"error": "text"}`` must not
+    # blow up inside the hook: check the inner value too. The host swallows a hook exception and
+    # declines, so the damage would be a missed classification, not a misroute — a guard is cheaper.
+    _inner = _body.get("error") if isinstance(_body, dict) else None
+    _nested = _inner.get("code") if isinstance(_inner, dict) else ""
+    code = str(error_code or getattr(error, "error_code", "") or _nested or "").strip().lower()
+    # Two different failures, two different reasons. A plan-only exhaustion is not a malformed
+    # request: the model announced an action, was nudged twice, and never produced a call --
+    # ``incomplete_response`` says exactly that, and ``format_error`` would tell the user to
+    # start a clean session over a request that was fine. A rejected model parameter *is* a bad
+    # request, so it keeps ``format_error`` and its accurate copy.
+    reasons = {
+        "cursor_plan_only": "incomplete_response",
+        "cursor_invalid_params": "format_error",
+    }
+    reason = reasons.get(code)
+    if reason is None:
+        # A THIRD raise site carries no code: ``_split_model`` rejects a malformed
+        # ``id@key=value`` string before the bridge exists, with a plain ValueError whose text
+        # names our own parser. The host treats ValueErrors as local validation bugs and answers
+        # with another provider — a silent wrong-model reply to a configuration typo. Recognise our
+        # own text; the host honours a verdict that opts out even for a ValueError subclass.
+        first_arg = getattr(error, "args", ())
+        text = str(first_arg[0]) if first_arg else ""
+        if text.startswith("Cursor model parameters"):
+            return {"reason": "format_error", "retryable": False, "should_fallback": False}
+        return None
+    return {"reason": reason, "retryable": False, "should_fallback": False}
+
+
+# Cursor failure texts that describe a CONFIGURATION error: identical parameters can never
+# succeed on retry, and a fallback would answer from a different model without saying so.
+_PERMANENT_ERROR_HINTS = ("invalid parameters", "ai model not found")
+
+
+def _permanent_error_code(failure: Any) -> str:
+    """The terminal provider code for a permanent Cursor configuration failure, else ''."""
+    text = str(failure or "").lower()
+    if any(hint in text for hint in _PERMANENT_ERROR_HINTS):
+        return "cursor_invalid_params"
+    return ""
 
 
 def _run_timeout_seconds() -> float:
@@ -1406,7 +1481,15 @@ class CursorSDKClient:
                 selected_model["id"], selected_model["params"], catalog
             )
             if error:
-                raise ValueError(error)
+                # A rejected @parameter is a permanent configuration failure, and it is raised
+                # BEFORE any run. A bare ValueError here reads to the host as a local validation
+                # bug (``_is_local_validation_error`` -> unclassified -> fallback chain), so the
+                # turn would be answered by another provider without saying so — the exact
+                # failure this code exists to prevent. CursorSDKRunError is a RuntimeError, so the
+                # host takes the classified path and our verdict stops the fallback.
+                raise CursorSDKRunError(
+                    error, status_code=400, error_code="cursor_invalid_params"
+                )
         if selected_model:
             options["model"] = selected_model
         return setup_client.create_agent(options)
@@ -1653,7 +1736,8 @@ class CursorSDKClient:
                 if fail_on_exhaustion:
                     raise CursorSDKRunError(
                         "Cursor returned no valid Hermes tool call for a required or announced action; "
-                        "recovery exhausted. No tool action was executed by the adapter."
+                        "recovery exhausted. No tool action was executed by the adapter.",
+                        error_code="cursor_plan_only",
                     )
                 yield from held
                 for block in dropped:
@@ -1737,6 +1821,18 @@ class CursorSDKClient:
                 status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
                 status = str(status_value or "").upper()
                 if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                    # A permanent configuration failure must not be retried or silently
+                    # answered by another provider: mark it terminal for the classifier.
+                    # The text can arrive as a stream-event message or as the result's status
+                    # message depending on the path, so both are checked.
+                    detail = str(failure or getattr(result, "status_message", "") or "")
+                    code = _permanent_error_code(detail)
+                    if code:
+                        raise CursorSDKRunError(
+                            detail or f"Cursor SDK run ended with status {status}",
+                            status_code=400,
+                            error_code=code,
+                        )
                     raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
                 tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
                 if tail:

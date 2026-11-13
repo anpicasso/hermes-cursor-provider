@@ -1,0 +1,174 @@
+"""A plan-only failure must not be answered silently by a different model.
+
+The recovery loop nudges twice when a model announces an action and then produces no
+tool call, and fails closed when the nudges are exhausted. That failure was
+indistinguishable from a transport error, so the host could retry it and, on the next
+fallback provider, answer the user with a different model without saying so. These
+tests pin the structured code, the profile classification that stops it, and that every
+other failure is left to the host's own retry and fallback.
+"""
+from __future__ import annotations
+
+import importlib
+import sys
+import types
+
+import pytest
+
+from hermes_cursor_provider import client as client_module
+from hermes_cursor_provider.client import CursorSDKClient, classify_cursor_error
+
+from test_client import _tool, fake_sdk  # noqa: F401  (autouse fixture of test_client)
+
+
+def _plan_only_error(client):
+    """Stream a reply that only announces an action, with a tool offered."""
+    sdk = client._sdk_client()
+    sdk.result.result = "I'll read the file and then tell you what it says."
+    with pytest.raises(client_module.CursorSDKRunError) as excinfo:
+        list(
+            client.chat.completions.create(
+                model="auto",
+                messages=[{"role": "user", "content": "read the file"}],
+                tools=[_tool()],
+                stream=True,
+            )
+        )
+    return excinfo.value
+
+
+def test_recovery_exhaustion_carries_a_structured_code(fake_sdk):  # noqa: F811
+    """The fail-closed raise is identifiable by code, not by message text."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        error = _plan_only_error(client)
+    finally:
+        client.close()
+    assert error.error_code == "cursor_plan_only"
+
+
+def test_plan_only_is_classified_terminal_and_does_not_fall_back():
+    """The verdict stops the retry and the cross-provider answer."""
+    assert classify_cursor_error(error_code="cursor_plan_only") == {
+        "reason": "incomplete_response",
+        "retryable": False,
+        "should_fallback": False,
+    }
+
+
+def test_invalid_params_is_classified_terminal_with_the_malformed_request_reason():
+    """A rejected model parameter IS a bad request, so it keeps format_error's copy."""
+    assert classify_cursor_error(error_code="cursor_invalid_params") == {
+        "reason": "format_error",
+        "retryable": False,
+        "should_fallback": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("AI Model Not Found Invalid parameters for registry model", "cursor_invalid_params"),
+        ("Invalid parameters: reasoning_effort", "cursor_invalid_params"),
+        ("You're out of usage. Switch to Auto.", ""),
+        ("", ""),
+    ],
+)
+def test_permanent_error_code_matches_configuration_failures_only(text, expected):
+    assert client_module._permanent_error_code(text) == expected
+
+
+def test_permanent_configuration_failure_raises_a_terminal_code():
+    """The wiring, not just the helper: the raise carries the code the classifier keys on.
+
+    Live QA produced this exact text for reasoning_effort=bogus; without the code it burned
+    three runs and was answered by another provider.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    sdk.result.status = "ERROR"
+    sdk.result.status_message = "AI Model Not Found Invalid parameters for registry model"
+    try:
+        with pytest.raises(client_module.CursorSDKRunError) as excinfo:
+            client.chat.completions.create(
+                model="composer-2.5",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+    finally:
+        client.close()
+    assert excinfo.value.error_code == "cursor_invalid_params"
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"error_code": "cursor_run_timeout"},
+        {"error_code": "cursor_sdk_run_failed"},
+        {"error_code": ""},
+        {},
+        {"status_code": 429, "message": "out of usage"},
+        {"status_code": 502, "message": "Cursor SDK run ended with status error"},
+    ],
+)
+def test_every_other_failure_is_left_to_the_host(kwargs):
+    """Timeouts, quotas and unknown failures keep the host's retry and fallback."""
+    assert classify_cursor_error(**kwargs) is None
+
+
+def test_the_classification_is_registered_on_the_profile(monkeypatch):
+    """A verdict nobody wired into the profile is dead code."""
+    import importlib.util
+    from pathlib import Path
+
+    providers = types.ModuleType("providers")
+    base = types.ModuleType("providers.base")
+
+    class ProviderProfile:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    base.ProviderProfile = ProviderProfile
+    providers.base = base
+    registered = []
+    providers.register_provider = registered.append
+    monkeypatch.setitem(sys.modules, "providers", providers)
+    monkeypatch.setitem(sys.modules, "providers.base", base)
+
+    # Load the plugin package by path: its name is not importable on every runner,
+    # and this must not depend on the working directory or pytest's import mode.
+    package_dir = Path(__file__).resolve().parents[1] / "provider"
+    spec = importlib.util.spec_from_file_location(
+        "cursor_provider_under_test",
+        package_dir / "__init__.py",
+        submodule_search_locations=[str(package_dir)],
+    )
+    provider = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = provider
+    spec.loader.exec_module(provider)
+
+    assert registered and registered[0] is provider.profile
+    verdict = provider.profile.classify_api_error
+    assert verdict.__name__ == "classify_cursor_error"
+    assert verdict(error_code="cursor_plan_only") == {
+        "reason": "incomplete_response",
+        "retryable": False,
+        "should_fallback": False,
+    }
+    assert verdict(status_code=429, message="out of usage") is None
+
+
+def test_the_reason_is_a_reason_the_host_actually_knows():
+    """An invented reason string makes the hook silently inert: the host drops it.
+
+    ``agent.error_classifier._profile_verdict`` coerces ``reason`` with
+    ``FailoverReason(reason)`` and returns None on ValueError, so a typo would leave the
+    failure exactly as retryable and fallback-eligible as before. Hermes is not a
+    dependency of this plugin, so this check is skipped where it cannot run.
+    """
+    host = pytest.importorskip("agent.error_classifier")
+    verdict = classify_cursor_error(error_code="cursor_plan_only")
+    reason = host.FailoverReason(verdict["reason"])
+    assert reason is host.FailoverReason.incomplete_response
+    assert reason not in host.RETRYABLE_CLIENT_REASONS

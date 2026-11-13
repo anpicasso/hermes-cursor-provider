@@ -533,7 +533,9 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(adapter.CursorSDKRunError, "required or announced") as caught:
             self.request(tool_choice="required")
         self.assertEqual(caught.exception.status_code, 502)
-        self.assertEqual(caught.exception.error_code, "cursor_sdk_run_failed")
+        # The fail-closed raise carries its own code so the profile can classify this
+        # as terminal; a bare "cursor_sdk_run_failed" made it retryable and fallback-eligible.
+        self.assertEqual(caught.exception.error_code, "cursor_plan_only")
         self.assertEqual(len(self.sdk.messages), 3)
         self.assertTrue(self.sdk.agents[0].closed)
 
