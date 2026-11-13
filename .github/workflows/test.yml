@@ -19,5 +19,11 @@ jobs:
       - run: pip install 'cursor-sdk>=1.0.32,<2' pytest
       - run: pytest -q
       - run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
-      - run: pip install -e "$RUNNER_TEMP/hermes-agent"
+      # hermes-agent pins Pillow 13 while browser-harness 0.1.13 still pins
+      # pillow==12.3.0; pip cannot resolve that pair. uv's override is the
+      # project's own documented resolution (see [tool.uv] in its pyproject).
+      - run: |
+          pip install uv
+          printf 'Pillow==13.0.0\n' > "$RUNNER_TEMP/pillow-override.txt"
+          uv pip install --system --override "$RUNNER_TEMP/pillow-override.txt" -e "$RUNNER_TEMP/hermes-agent"
       - run: PYTHONPATH="$RUNNER_TEMP/hermes-agent" python scripts/current_main_probe.py
