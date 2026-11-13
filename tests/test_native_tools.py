@@ -325,7 +325,8 @@ def test_retry_after_incomplete_block_parses_the_corrected_call():
         client.close()
 
 
-def test_retry_happens_at_most_once():
+def test_retry_happens_at_most_once(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_MAX_TOOL_RETRIES", "1")  # the old one-retry bound
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
     try:
@@ -352,7 +353,8 @@ def test_plain_text_answer_without_tool_attempt_is_not_retried():
         client.close()
 
 
-def test_poisoned_session_agent_is_reset_after_failed_tool_turn():
+def test_poisoned_session_agent_is_reset_after_failed_tool_turn(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_MAX_TOOL_RETRIES", "1")  # keep this test on two runs
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
     try:

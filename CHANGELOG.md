@@ -5,6 +5,7 @@
 - Opt-in native Hermes tools behind `HERMES_CURSOR_NATIVE_TOOLS` (default off). On the stream path, offered Hermes tools are registered as inert Cursor custom tools in the `mcp` capability group; no MCP servers are loaded, and Hermes still decides and runs every tool. A call cap (`HERMES_CURSOR_NATIVE_MAX_CALLS`, default 64) and stream keep-alives bound the run. Non-stream requests stay on the upstream text protocol. Unset the switch to turn it off.
 - Per-request `native_tools=on|off` in the model-name suffix overrides `HERMES_CURSOR_NATIVE_TOOLS` both ways and is not sent to Cursor. Under a multiplexing gateway, set the env form and `HERMES_CURSOR_MODEL_VARIANTS` in the launch `.env`; a named profile's `.env` does not reach the plugin.
 - A native run is cancelled when Cursor starts a second answer. The session agent is retired and the next turn re-sends the full transcript. Usage is the sum of turns up to the cut, so Cursor's dashboard can show slightly more than Hermes reports.
+- A malformed or unterminated `<tool_call>` block that arrives after streamed prose is now counted as a rejected tool turn instead of being returned as inert answer text. Native-channel failure narration after a real native miss is treated the same way. The native/rejected corrective budget defaults to two nudges and is capped at two (`HERMES_CURSOR_MAX_TOOL_RETRIES=1` restores the old one-retry bound); exhaustion fails closed instead of returning raw protocol.
 
 ## 0.4.1
 

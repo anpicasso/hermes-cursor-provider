@@ -207,7 +207,7 @@ def classify_cursor_error(
         # own text; the host honours a verdict that opts out even for a ValueError subclass.
         first_arg = getattr(error, "args", ())
         text = str(first_arg[0]) if first_arg else ""
-        if text.startswith("Cursor model parameters"):
+        if text.startswith("Cursor model parameter"):
             return {"reason": "format_error", "retryable": False, "should_fallback": False}
         return None
     return {"reason": reason, "retryable": False, "should_fallback": False}
@@ -642,6 +642,47 @@ def _action_only(text: str, *, partial: bool = False) -> bool:
                for start in _ACTION_STARTS)
 
 
+# A native-channel miss is often narrated instead of retried by the model. Only
+# treat it as a failed tool turn when a native miss actually happened this turn.
+_NATIVE_FAILURE_RE = re.compile(
+    r"\b(?:native\s+(?:channel|tool(?:s)?)\s+(?:failed|unavailable|not\s+available|not\s+found)"
+    r"|tool\s+(?:not\s+available|not\s+found))\b",
+    re.I,
+)
+
+
+def _max_tool_retries() -> int:
+    """Corrective nudges for native/rejected evidence; 1 restores the old bound."""
+    raw = os.environ.get("HERMES_CURSOR_MAX_TOOL_RETRIES", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return min(2, max(1, value))
+
+
+def _native_failure_narration(text: str) -> bool:
+    return bool(_NATIVE_FAILURE_RE.search(text or ""))
+
+
+def _native_failure_prefix(text: str) -> bool:
+    """True while streamed text could still become native-failure narration."""
+    value = str(text or "").strip().lower()
+    if not value:
+        return False
+    return any(
+        phrase.startswith(value) or value.startswith(phrase)
+        for phrase in (
+            "native channel failed",
+            "native channel is unavailable",
+            "native tool not available",
+            "native tool not found",
+            "tool not available",
+            "tool not found",
+        )
+    )
+
+
 def _image_payload(url: str) -> dict[str, str] | None:
     value = url.strip()
     if value.startswith("https://"):
@@ -1028,6 +1069,12 @@ class _ToolBlockStream:
             self._scan = len(self._OPEN)
             self._quoted = self._escaped = False
             kind = "rejected" if tail.lstrip().startswith(self._OPEN) else "text"
+            if kind == "rejected":
+                body = tail.lstrip()[len(self._OPEN):].lstrip()
+                # An unterminated block counts only when it actually carries a JSON body;
+                # prose that merely mentions the protocol must not trigger recovery.
+                if body.startswith(("{", "[")):
+                    self.rejected += 1
             yield (kind, self._record(tail))
 
     def _record(self, part: str) -> str:
@@ -1617,6 +1664,7 @@ class CursorSDKClient:
         started: float,
         native_on: bool = False,
         control: Any = None,
+        info: dict[str, Any] | None = None,
     ) -> Any:
         """Stream one SDK run into ``parser``; returns (result, streamed, failure, stopped, peak).
 
@@ -1816,6 +1864,8 @@ class CursorSDKClient:
                     elif allowed_names and name:
                         miss = _native_miss_name(name, args) if native_on else str(name)
                         native["misses"].append(miss)
+                        if info is not None:
+                            info["native_misses"] = len(native["misses"])
                         _LOG.warning("cursor provider: model called unknown native tool %r", name)
         else:
             iter_text = getattr(run, "iter_text", None)
@@ -1912,11 +1962,15 @@ class CursorSDKClient:
         Each attempt is exactly one SDK run (``_run_agent_once``), so retries are never
         nested or multiplied. A turn is accepted when it produced a valid call or an
         ordinary answer. Recovery covers required/named tool choices, short action-only
-        announcements, unknown native tool names, and rejected blocks; native/rejected
-        evidence keeps PR1's one-retry bound, action/required recovery gets PR3's two.
+        announcements, unknown native tool names, rejected blocks (including an
+        unterminated block after streamed prose), and native-channel failure narration.
+        Native/rejected evidence gets ``HERMES_CURSOR_MAX_TOOL_RETRIES`` nudges (default 2,
+        capped at 2); action/required recovery gets two.
         """
         require_call = bool(allowed_names) and require_call
         info = info if info is not None else {}
+        scope = str(info.get("scope") or "ephemeral")
+        recover_enabled = _flag("HERMES_CURSOR_RETRY", True) and bool(allowed_names)
         # Each attempt carries (result, its peak per-turn usage) so billed totals can be summed
         # without summing the one-turn context anchor.
         attempts: list[tuple[Any, Any]] = []
@@ -1950,15 +2004,33 @@ class CursorSDKClient:
                             # discarded protocol, not answer text.
                             dropped.extend(
                                 value for kind, value in held if kind == "rejected")
-                            yield from (item for item in held if item[0] != "rejected")
+                            held_text_so_far = "".join(
+                                value for kind, value in held if kind == "text")
+                            suppress_narration = bool(
+                                attempt_info.get("native_misses")
+                            ) and _native_failure_narration(held_text_so_far)
+                            yield from (
+                                item for item in held
+                                if item[0] != "rejected"
+                                and not (suppress_narration and item[0] == "text")
+                            )
                             held.clear()
                         elif not require_call and not _action_only("".join(
                             value for kind, value in held if kind == "text"
-                        ), partial=True):
+                        ), partial=True) and not _native_failure_prefix("".join(
+                            value for kind, value in held if kind == "text"
+                        )):
                             holding = False
                             yield from held
                             held.clear()
                     else:
+                        if event[0] == "rejected":
+                            dropped.append(event[1])
+                            # Recovery will replace the failed turn; a retry-disabled
+                            # parser pass-through keeps the raw block for existing tests.
+                            if not recover_enabled:
+                                yield event
+                            continue
                         yield event
             finally:
                 execution.close()
@@ -1967,22 +2039,40 @@ class CursorSDKClient:
             info["intercepted"] = info.get("intercepted", 0) + attempt_info.get("intercepted", 0)
             info["rejected"] = info.get("rejected", 0) + attempt_info.get("rejected", 0)
             info["cut"] = info.get("cut") or attempt_info.get("cut")
-            rejected = any(kind == "rejected" for kind, _ in held)
+            rejected_blocks = int(attempt_info.get("rejected", 0) or 0)
+            # Count every rejected block, not only the ones still held: once prose has
+            # released the hold, a later malformed/unterminated block is still a failed
+            # tool turn and must not be returned as inert protocol text.
+            rejected = bool(rejected_blocks) or any(kind == "rejected" for kind, _ in held)
             held_text = "".join(value for kind, value in held if kind == "text")
             announced = bool(allowed_names) and _action_only(held_text or content)
-            recovery = _flag("HERMES_CURSOR_RETRY", True) and bool(allowed_names) and (
-                require_call or announced or rejected or bool(attempt_misses)
+            narration = bool(attempt_misses) and _native_failure_narration(held_text or content)
+            recovery = recover_enabled and (
+                require_call or announced or rejected or narration or bool(attempt_misses)
             )
             if calls or not recovery:
                 yield from held
-                for block in dropped:
-                    content = content.replace(block, "", 1)
+                if calls or recover_enabled:
+                    for block in dropped:
+                        content = content.replace(block, "", 1)
                 return _aggregate_result(attempts), calls, content.strip()
+            if rejected or narration:
+                # Metadata only: SECURITY promises the plugin never logs prompts or tool
+                # payloads, so the failed turn's text must not reach the log even redacted.
+                _LOG.warning(
+                    "cursor provider: failed tool turn scope=%s finish=%s attempt=%d "
+                    "rejected=%d native_misses=%s",
+                    scope,
+                    getattr(result, "status", "") or "?",
+                    attempt,
+                    rejected_blocks,
+                    len(attempt_misses),
+                )
             if budget is None:
-                # Native/rejected evidence keeps the original single corrective retry;
-                # required/named and announced actions get up to two nudges.
-                fail_on_exhaustion = require_call or announced
-                budget = 2 if fail_on_exhaustion else 1
+                fail_on_exhaustion = require_call or announced or rejected or narration
+                # Required/named/announced actions keep two nudges; native/rejected/narration
+                # evidence uses the configured bound so `1` restores the old one-retry cap.
+                budget = 2 if (require_call or announced) else _max_tool_retries()
             elif announced and budget < 2:
                 # A retry that now announces an action inherits the action budget.
                 fail_on_exhaustion = True
@@ -2071,6 +2161,7 @@ class CursorSDKClient:
                     started=started,
                     native_on=native_on,
                     control=control,
+                    info=info,
                 )
             finally:
                 with self._runs_lock:
@@ -2261,7 +2352,7 @@ class CursorSDKClient:
             prompt, allowed_names = render_prompt(
                 request_messages, tools=tools, tool_choice=tool_choice, native=native_on,
             )
-            info: dict[str, Any] = {}
+            info: dict[str, Any] = {"scope": session_scope}
             result, calls, content = yield from self._run_agent(
                 session.agent,
                 prompt=prompt,

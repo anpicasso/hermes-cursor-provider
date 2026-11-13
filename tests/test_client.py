@@ -770,7 +770,8 @@ def test_stream_keeps_unoffered_and_malformed_blocks_as_text(block, monkeypatch)
         client.close()
 
 
-def test_stream_keeps_incomplete_block_as_verbatim_text():
+def test_stream_keeps_incomplete_block_as_verbatim_text(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_RETRY", "0")  # parser pass-through behaviour, not the retry
     text = 'Example: <tool_call>{"function": {"name": "read_file", "arguments": "{}"'
     assert extract_tool_calls(text, {"read_file"}) == ([], text)
     client = CursorSDKClient(api_key="crsr_test")

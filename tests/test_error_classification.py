@@ -159,6 +159,17 @@ def test_the_classification_is_registered_on_the_profile(monkeypatch):
     assert verdict(status_code=429, message="out of usage") is None
 
 
+def test_a_bad_native_tools_value_is_terminal_too():
+    """The plugin-only switch shares the malformed-parameter path and must not fall back."""
+    with pytest.raises(ValueError) as excinfo:
+        client_module._plugin_params("auto@native_tools=maybe")
+    assert classify_cursor_error(excinfo.value) == {
+        "reason": "format_error",
+        "retryable": False,
+        "should_fallback": False,
+    }
+
+
 def test_the_reason_is_a_reason_the_host_actually_knows():
     """An invented reason string makes the hook silently inert: the host drops it.
 
