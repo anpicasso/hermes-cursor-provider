@@ -436,6 +436,20 @@ def test_explicit_key_wins_over_the_process_cursor_api_key(monkeypatch):
     assert FakeCursorClient.launches[0]["allow_api_key_env_fallback"] is True
 
 
+def test_bridge_launch_never_receives_the_account_key():
+    """The plugin passes the key per RPC; bridge argv/env exposure is SDK-owned (issue 10)."""
+    client = CursorSDKClient(api_key="crsr_secret_should_not_leak")
+    try:
+        client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    launch = FakeCursorClient.launches[0]
+    assert "api_key" not in launch
+    assert "crsr_secret_should_not_leak" not in json.dumps(launch)
+
+
 def test_session_reuses_agent_across_facades_and_sends_only_delta():
     first = CursorSDKClient(api_key="crsr_test")
     first.chat.completions.create(
