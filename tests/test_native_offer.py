@@ -630,6 +630,22 @@ def test_13a_status_error_after_calls_returns_them(monkeypatch, caplog):
         client.close()
 
 
+def test_13m_status_error_after_calls_bills_the_sum(monkeypatch):
+    """A failure after accepted calls must bill every completed turn, not the peak."""
+    _switch(monkeypatch, True)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [_call_a(), _usage_event(10), _thinking(), _usage_event(6), _status("ERROR", "boom")]
+        _install(sdk, [(script, _result(status="ERROR"), False)])
+        chunks = _go(client, [{"role": "user", "content": "go"}], [READ], stream=True)
+        assert _names(chunks) == ["read_file"]
+        assert chunks[-1].usage.prompt_tokens == 16
+        assert chunks[-1].usage.initial_prompt_tokens == 10
+    finally:
+        client.close()
+
+
 def test_13b_deadline_on_next_after_a_call_returns_it(monkeypatch, caplog):
     _switch(monkeypatch, True)
     caplog.set_level(logging.WARNING, logger=LOGGER)

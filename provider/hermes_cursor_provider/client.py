@@ -1691,7 +1691,10 @@ class CursorSDKClient:
         billed = SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0)
 
         def _calls_back(label: str | None = None, *, who: str | None = None, usage: Any = None):
-            usage = usage or peak_usage or SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0)
+            # Failure paths return the calls already accepted, so they bill every completed
+            # turn. ``peak_usage`` is only the context anchor; using it here dropped the
+            # other turns' spend from the billed total.
+            usage = usage if usage is not None else billed
             n = len(native["intercepted"])
             if who:
                 _LOG.info("cursor: run cancelled by %s after %d native calls", who, n)
