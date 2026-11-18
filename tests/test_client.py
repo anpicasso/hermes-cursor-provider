@@ -31,6 +31,9 @@ class FakeResult:
     stream_text: str = ""
     status: str = "FINISHED"
     status_message: str = ""
+    # Largest per-turn prompt the run reports as a ``usage`` event (0 = no event), which is
+    # the context anchor the plugin reads as ``result.initial_prompt_tokens``.
+    peak_input_tokens: int = 0
 
 
 def _assistant_event(text):
@@ -55,6 +58,13 @@ class FakeRun:
     def stream(self):
         if self._result.stream_text:
             yield _assistant_event(self._result.stream_text)
+        if self._result.peak_input_tokens:
+            yield SimpleNamespace(
+                type="usage",
+                usage=SimpleNamespace(
+                    input_tokens=self._result.peak_input_tokens, cache_read_tokens=0
+                ),
+            )
         if self._result.status != "FINISHED":
             yield _status_event(self._result.status, self._result.status_message)
 
@@ -1739,3 +1749,276 @@ def test_a_wait_failure_is_not_reported_as_our_timeout():
         isinstance(excinfo.value, client_module.CursorSDKRunError)
         and excinfo.value.error_code == "cursor_run_timeout"
     ), "an SDK failure was reported as our timeout"
+
+
+# --- retained SDK thread token budget ------------------------------------------------
+# The agent re-submits its whole accumulated thread on every send, so the plugin retires it
+# once the last call's reported peak prompt reaches the budget; the next send carries the full
+# canonical transcript to a fresh agent. These pin the budget's source, the retire threshold,
+# and the agent lifecycle (including replay continuity in both prompt modes).
+
+
+def test_parse_token_count_reads_bare_k_and_m_notation():
+    assert client_module._parse_token_count("250000") == 250_000
+    assert client_module._parse_token_count("250k") == 250_000
+    assert client_module._parse_token_count("1.5m") == 1_500_000
+    assert client_module._parse_token_count(" 500K ") == 500_000
+
+
+def test_parse_token_count_rejects_unreadable_values():
+    for value in ("", "lots", "k", "nan", "inf"):
+        assert client_module._parse_token_count(value) is None, value
+
+
+def test_context_window_keeps_its_mapping_through_the_shared_parser():
+    assert client_module._context_window("grok-4.7@context=500k") == 500_000
+    assert client_module._context_window("grok-4.7@context=120000") == 120_000
+    assert client_module._context_window("grok-4.7@context=1m") == 1_000_000
+    assert client_module._context_window("grok-4.7@fast=true") is None
+    assert client_module._context_window("grok-4.7@context=lots") is None
+    assert client_module._context_window("grok-4.7@context=0") is None
+
+
+def test_session_token_budget_defaults_to_the_declared_window(monkeypatch):
+    monkeypatch.delenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", raising=False)
+    assert client_module._session_token_budget("grok-4.7@context=500k") == 500_000
+
+
+def test_session_token_budget_is_off_without_a_window(monkeypatch):
+    monkeypatch.delenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", raising=False)
+    assert client_module._session_token_budget("auto") is None
+
+
+def test_env_budget_outranks_the_model_parameter(monkeypatch):
+    """The live model string carries context=, so an env value that lost to it could not act."""
+    for raw, expected in (("120000", 120_000), ("250k", 250_000), ("1m", 1_000_000)):
+        monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", raw)
+        assert client_module._session_token_budget("grok-4.7@context=500k") == expected, raw
+
+
+def test_env_budget_kill_switch(monkeypatch):
+    for raw in ("off", "OFF", "0", "false", "no"):
+        monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", raw)
+        assert client_module._session_token_budget("grok-4.7@context=500k") is None, raw
+
+
+def test_env_budget_malformed_falls_back_to_the_model(monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "lots")
+    with caplog.at_level(logging.WARNING):
+        assert client_module._session_token_budget("grok-4.7@context=500k") == 500_000
+    assert "HERMES_CURSOR_SESSION_TOKEN_BUDGET" in caplog.text
+
+
+def test_should_retire_session_thresholds():
+    retire = client_module._should_retire_session
+    assert retire(499_999, 500_000) is False
+    assert retire(500_000, 500_000) is True   # at the budget retires
+    assert retire(500_001, 500_000) is True
+    assert retire(0, 500_000) is False        # unknown never retires
+    assert retire(900_000, None) is False     # policy off
+
+
+def test_session_records_the_reported_peak_prompt():
+    """The retire decision reads session.last_input_tokens, so a call must write it."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.peak_input_tokens = 123_456
+    client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "first"}],
+        _cursor_session_scope="scope-peak",
+    )
+    sessions = list(client_module._SESSIONS.values())
+    client.close()
+    assert len(sessions) == 1
+    assert sessions[0].last_input_tokens == 123_456
+
+
+def test_session_retires_at_the_budget_and_resends_the_full_transcript(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "1000")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    sdk.result.peak_input_tokens = 1000        # exactly at the budget
+    client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "first-user"}],
+        _cursor_session_scope="scope-budget",
+    )
+    assert len(sdk.agents) == 1
+
+    sdk.result.peak_input_tokens = 10
+    client.chat.completions.create(
+        model="auto",
+        messages=[
+            {"role": "user", "content": "first-user"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "second-user"},
+        ],
+        _cursor_session_scope="scope-budget",
+    )
+    client.close()
+    assert len(sdk.agents) == 2, "the over-budget session did not retire its agent"
+    assert sdk.agents[0].closed
+    resent = sdk.agents[1].messages[0]["text"]
+    assert "first-user" in resent and "second-user" in resent, "the fresh agent got only a delta"
+
+
+def test_session_keeps_its_agent_below_the_budget(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "1000")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    sdk.result.peak_input_tokens = 999
+    client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "first-user"}],
+        _cursor_session_scope="scope-keep",
+    )
+    client.chat.completions.create(
+        model="auto",
+        messages=[
+            {"role": "user", "content": "first-user"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "second-user"},
+        ],
+        _cursor_session_scope="scope-keep",
+    )
+    client.close()
+    assert len(sdk.agents) == 1, "an under-budget session should reuse its agent"
+    assert not sdk.agents[0].closed
+    assert len(sdk.agents[0].messages) == 2
+    assert "second-user" in sdk.agents[0].messages[1]["text"]
+    assert "first-user" not in sdk.agents[0].messages[1]["text"]
+
+
+def test_session_budget_kill_switch_keeps_one_agent(monkeypatch):
+    """HERMES_CURSOR_SESSION_TOKEN_BUDGET=off disables the policy on the live config."""
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "off")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    sdk.result.peak_input_tokens = 10_000_000   # far past any window
+    for messages in (
+        [{"role": "user", "content": "first-user"}],
+        [
+            {"role": "user", "content": "first-user"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "second-user"},
+        ],
+    ):
+        client.chat.completions.create(
+            model="grok-4.7@context=500k",
+            messages=messages,
+            _cursor_session_scope="scope-off",
+        )
+    client.close()
+    assert len(sdk.agents) == 1, "the kill switch did not disable the policy"
+
+
+def test_session_without_a_reported_peak_never_retires(monkeypatch):
+    """0 means 'unknown' (no usage event), not 'over budget'."""
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "1000")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    for messages in (
+        [{"role": "user", "content": "first-user"}],
+        [
+            {"role": "user", "content": "first-user"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "second-user"},
+        ],
+    ):
+        client.chat.completions.create(
+            model="auto",
+            messages=messages,
+            _cursor_session_scope="scope-unknown",
+        )
+    client.close()
+    assert len(sdk.agents) == 1, "an unreported peak must not retire the agent"
+
+
+def test_budget_retirement_replays_tool_results_to_the_fresh_agent(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "1000")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = (
+        '<tool_call>{"id":"call_1","function":{"name":"read_file",'
+        '"arguments":{"path":"x"}}}</tool_call>'
+    )
+    sdk.result.peak_input_tokens = 1000
+    first = client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "inspect-x"}],
+        tools=[_tool()],
+        _cursor_session_scope="scope-tool-budget",
+    )
+    call = first.choices[0].message.tool_calls[0]
+    sdk.result.result = "done"
+    sdk.result.peak_input_tokens = 10
+    client.chat.completions.create(
+        model="auto",
+        messages=[
+            {"role": "user", "content": "inspect-x"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call.id, "content": "file-data"},
+        ],
+        tools=[_tool()],
+        _cursor_session_scope="scope-tool-budget",
+    )
+    client.close()
+    assert len(sdk.agents) == 2
+    resent = sdk.agents[1].messages[0]["text"]
+    assert "inspect-x" in resent and "file-data" in resent, "the tool result was dropped on replay"
+
+
+def test_budget_retirement_replays_the_full_transcript_in_native_mode(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "1000")
+    monkeypatch.setenv("HERMES_CURSOR_NATIVE_TOOLS", "1")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    sdk.result.peak_input_tokens = 1000
+    list(
+        client.chat.completions.create(
+            model="auto",
+            messages=[{"role": "user", "content": "first-user"}],
+            tools=[_tool()],
+            stream=True,
+            _cursor_session_scope="scope-native-budget",
+        )
+    )
+    sdk.result.peak_input_tokens = 10
+    list(
+        client.chat.completions.create(
+            model="auto",
+            messages=[
+                {"role": "user", "content": "first-user"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "second-user"},
+            ],
+            tools=[_tool()],
+            stream=True,
+            _cursor_session_scope="scope-native-budget",
+        )
+    )
+    client.close()
+    assert len(sdk.agents) == 2
+    assert sdk.agents[0].closed
+    assert "custom_tools" in sdk.options[1]["local"], "the fresh native agent lost its toolset"
+    resent = sdk.agents[1].messages[0]["text"]
+    assert "first-user" in resent and "second-user" in resent
