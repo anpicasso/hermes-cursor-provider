@@ -1287,7 +1287,9 @@ def _parse_token_count(raw: str) -> int | None:
             return int(float(text[:-1]) * 1_000)
         if text.endswith("m"):
             return int(float(text[:-1]) * 1_000_000)
-        return int(text)
+        # float() first, as the previous inline parser did, so an existing bare value keeps
+        # its old reading (``1e3`` was 1,000 before this helper existed).
+        return int(float(text))
     except (ValueError, OverflowError):
         return None
 

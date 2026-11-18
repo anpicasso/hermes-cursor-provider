@@ -1763,6 +1763,7 @@ def test_parse_token_count_reads_bare_k_and_m_notation():
     assert client_module._parse_token_count("250k") == 250_000
     assert client_module._parse_token_count("1.5m") == 1_500_000
     assert client_module._parse_token_count(" 500K ") == 500_000
+    assert client_module._parse_token_count("1e3") == 1_000  # the old inline parser's reading
 
 
 def test_parse_token_count_rejects_unreadable_values():
