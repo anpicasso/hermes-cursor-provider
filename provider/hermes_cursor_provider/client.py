@@ -369,8 +369,8 @@ def _run_cleanup(call: Any, what: str) -> None:
     """Run one cleanup call without letting a wedged transport add a full timeout.
 
     Cleanup still happens on a worker so a hung ``CancelRun``/``CloseAgent`` cannot
-    push a turn past its deadline. If it outlives the grace it is abandoned; the SDK's
-    own unary timeout eventually reclaims the worker.
+    push a turn past its deadline. If it outlives the grace it continues in the
+    background; the SDK's own unary timeout bounds the remaining call.
     """
     grace = _cleanup_grace_seconds()
 
@@ -382,7 +382,7 @@ def _run_cleanup(call: Any, what: str) -> None:
     worker.start()
     worker.join(grace)
     if worker.is_alive():
-        _LOG.warning("cursor: %s did not finish within %gs; abandoning the call", what, grace)
+        _LOG.warning("cursor: %s did not finish within %gs; cleanup continuing in background", what, grace)
 
 
 def _cancel_run(run: Any) -> None:

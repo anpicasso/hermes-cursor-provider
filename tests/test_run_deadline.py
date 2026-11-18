@@ -268,7 +268,7 @@ def test_read_outcome_hands_off_a_deadline_result_exactly_once():
     )
 
 
-def test_cleanup_that_blocks_does_not_extend_the_deadline(monkeypatch, cleanup_registry):
+def test_cleanup_that_blocks_does_not_extend_the_deadline(monkeypatch, cleanup_registry, caplog):
     release = threading.Event()
 
     class HangingWaitRun:
@@ -317,4 +317,6 @@ def test_cleanup_that_blocks_does_not_extend_the_deadline(monkeypatch, cleanup_r
     deadline = time.monotonic() + 2
     while not run.cancelled and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert run.cancelled, "the abandoned cancel worker never reached the run"
+    assert run.cancelled, "the background cancel worker never reached the run"
+    assert "cleanup continuing in background" in caplog.text
+    assert "abandoning the call" not in caplog.text

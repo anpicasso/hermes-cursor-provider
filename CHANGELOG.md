@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+- Clarifies that cleanup exceeding the short grace continues in the background; the bounded wait and SDK timeout are unchanged. Verified with six live turns and five session rollovers: all six CloseAgent calls completed and owned bridge processes exited after teardown.
 
 - Bounds the retained SDK thread with a session token budget. The agent re-submits its whole accumulated thread on every send, so a long session can submit several times the model's declared window; once a run's largest per-turn prompt (`usage.initial_prompt_tokens`) reaches the budget, the agent is retired and the next send re-sends the full canonical transcript to a fresh one, so context survives while Cursor's re-read is bounded. The budget follows the model string's `context=` parameter (`500k` → 500,000, i.e. 1.0× the declared window); `HERMES_CURSOR_SESSION_TOKEN_BUDGET` overrides it and outranks the parameter (`250k`/`250000` accepted, `off`/`0` disables the policy), and with neither the policy is off. A run that emits no `usage` event reports no peak and never retires. Adapted from `xiaopingli/hermes-cursor-provider@67a9d673e394fced4c630a3b6d3b14225f8c863f` (MIT), not merged.
 
